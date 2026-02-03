@@ -1,0 +1,33 @@
+# Stable Diffusion 从零实现
+
+## 目标
+创建一个简化版 Stable Diffusion，深入理解扩散模型的核心原理
+
+## 任务清单
+
+### 1. 理论基础与规划
+- [x] 创建实现计划和理论文档
+- [x] 解释扩散模型的数学原理
+
+### 2. 核心组件实现
+- [x] 实现前向扩散过程 (Forward Diffusion)
+- [x] 实现噪声调度器 (Noise Scheduler)
+- [x] 实现 U-Net 架构
+  - [x] ResNet Block
+  - [x] Attention Block
+  - [x] Time Embedding
+  - [x] Down/Up Sampling Blocks
+- [x] 实现逆向扩散过程 (Reverse Diffusion / Sampling)
+
+### 3. 条件生成组件
+- [ ] 实现 CLIP 文本编码器（或简化版本）
+- [ ] 实现交叉注意力 (Cross-Attention)
+
+### 4. 训练与测试
+- [x] 实现训练循环
+- [x] 在 MNIST/简单数据集上测试
+- [x] 实现推理/采样流程
+
+### 5. 文档与可视化
+- [/] 创建可视化演示
+- [ ] 编写使用说明

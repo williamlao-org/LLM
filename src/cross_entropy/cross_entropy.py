@@ -86,9 +86,24 @@ def cross_entropy_stable(y_pred, y_true):
     return torch.mean(loss)
 
 
+def ce(y_pred: torch.Tensor, y_true: torch.Tensor):
+    max_value = y_pred.max(dim=1, keepdim=True).values
+    y_shifted = y_pred - max_value
+
+    log_exp_sum = torch.log(torch.exp(y_shifted).sum(dim=1, keepdim=True))
+
+    N = y_pred.shape[0]
+    probs = y_shifted[torch.arange(N), y_true]
+
+    loss = -(probs - log_exp_sum)
+
+    return loss.mean()
+
+
 if __name__ == "__main__":
     y_pred = torch.tensor([[1000.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
     y_true = torch.tensor([2, 1])
     print(cross_entropy(y_pred, y_true))
     print(cross_entropy_stable(y_pred, y_true))
     print(torch.nn.functional.cross_entropy(y_pred, y_true))
+    print(ce(y_pred, y_true))

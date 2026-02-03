@@ -1,0 +1,137 @@
+# Stable Diffusion 从零实现 - Walkthrough
+
+## 项目概览
+
+我们从零实现了一个简化版 Stable Diffusion，包含扩散模型的所有核心组件。
+
+### 项目结构
+
+```
+f:\Projects\llm\src\stable_diffusion\
+├── __init__.py      # 包入口
+├── scheduler.py     # 噪声调度器 (DDPMScheduler)
+├── unet.py          # U-Net 噪声预测网络
+├── diffusion.py     # 扩散过程 (训练+采样)
+├── train.py         # 训练脚本
+└── sample.py        # 采样脚本
+```
+
+---
+
+## 核心原理
+
+### 扩散模型的两个过程
+
+```mermaid
+graph LR
+    A[原始图像 x₀] -->|"加噪声 (前向)"| B[纯噪声 xₜ]
+    B -->|"去噪声 (逆向)"| C[生成图像]
+```
+
+### 关键公式
+
+| 过程 | 公式 |
+|------|------|
+| **前向扩散** | `x_t = √(ᾱ_t) · x_0 + √(1-ᾱ_t) · ε` |
+| **训练目标** | `L = MSE(ε, ε_θ(x_t, t))` |
+| **逆向采样** | `x_{t-1} = 1/√α_t · (x_t - β_t/√(1-ᾱ_t) · ε_θ) + σ_t · z` |
+
+---
+
+## 实现的组件
+
+### 1. [DDPMScheduler](file:///f:/Projects/llm/src/stable_diffusion/scheduler.py)
+
+管理噪声的添加和去除，预计算所有 alpha 参数：
+
+```python
+scheduler = DDPMScheduler(num_timesteps=1000)
+x_t, noise = scheduler.add_noise(x_0, t)  # 前向
+x_prev = scheduler.step(predicted_noise, t, x_t)  # 逆向
+```
+
+### 2. [UNet](file:///f:/Projects/llm/src/stable_diffusion/unet.py)
+
+预测噪声的核心网络，包含：
+- **TimeEmbedding**: 正弦位置编码 + MLP
+- **ResBlock**: 带时间条件的残差块
+- **SelfAttention**: 捕获全局依赖
+- **Down/Upsample**: 编码器-解码器结构
+
+```python
+unet = UNet(in_channels=1, out_channels=1, base_dim=64)
+noise_pred = unet(x_t, t)  # 预测噪声
+```
+
+### 3. [GaussianDiffusion](file:///f:/Projects/llm/src/stable_diffusion/diffusion.py)
+
+整合训练和采样：
+
+```python
+diffusion = GaussianDiffusion(unet, scheduler, device='cuda')
+
+# 训练
+loss = diffusion.training_loss(images)
+
+# 采样
+samples = diffusion.sample(shape=(16, 1, 32, 32))  # DDPM
+samples = diffusion.sample_ddim(shape, num_inference_steps=50)  # DDIM (快速)
+```
+
+---
+
+## 使用方法
+
+### 训练
+
+```bash
+# 使用 MNIST 训练
+python -m stable_diffusion.train --epochs 50 --device cuda
+
+# 自定义参数
+python -m stable_diffusion.train \
+    --epochs 100 \
+    --batch_size 128 \
+    --base_dim 64 \
+    --num_timesteps 1000
+```
+
+### 采样
+
+```bash
+# DDPM 采样 (慢但质量高)
+python -m stable_diffusion.sample --checkpoint best_model.pt --method ddpm
+
+# DDIM 采样 (快 20x)
+python -m stable_diffusion.sample --checkpoint best_model.pt --method ddim --ddim_steps 50
+```
+
+---
+
+## 与完整 Stable Diffusion 的差异
+
+| 特性 | 本实现 | 完整 SD |
+|------|--------|---------|
+| VAE | ❌ 直接在像素空间 | ✓ 潜在空间 |
+| 文本条件 | ❌ 无条件生成 | ✓ CLIP 编码 |
+| 模型大小 | ~2M 参数 | ~1B 参数 |
+| 分辨率 | 32x32 | 512x512+ |
+
+---
+
+## 下一步扩展
+
+1. **添加 VAE**: 在潜在空间训练，提高效率
+2. **条件生成**: 添加类别条件或文本条件
+3. **Classifier-Free Guidance**: 提升生成质量
+4. **更大规模训练**: 使用 CIFAR-10 或其他数据集
+
+我已经为你创建了完整的扩散模型实现，包含以下文件：
+
+| 文件 | 功能 |
+|------|------|
+| scheduler.py | DDPM 噪声调度器 - 控制前向/逆向扩散 |
+| unet.py | U-Net 网络 (2.56M 参数) - 预测噪声 |
+| diffusion.py | 扩散过程 - 训练损失 + DDPM/DDIM 采样 |
+| train.py | 训练脚本 - 支持 MNIST 和合成数据 |
+| sample.py | 采样脚本 - 生成图像 |
