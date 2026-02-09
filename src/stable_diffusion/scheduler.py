@@ -173,7 +173,7 @@ class DDPMScheduler:
         sqrt_one_minus_alpha_cumprod = self._extract(
             self.sqrt_one_minus_alphas_cumprod, t, x_0.shape
         )
-
+       
         # 应用前向扩散公式
         # x_t = √(ᾱ_t) * x_0 + √(1 - ᾱ_t) * ε
         x_t = sqrt_alpha_cumprod * x_0 + sqrt_one_minus_alpha_cumprod * noise
