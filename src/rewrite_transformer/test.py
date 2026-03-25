@@ -142,8 +142,9 @@ def test_trainTransformer():
         num_epochs=50,
         use_official_tokenizer=True,
         resume_training=True,
-        model_save_path='best_model.pth',
+        model_save_path="best_model.pth",
     )
+
 
 def test_generate():
     from rewrite_transformer.train import generate
@@ -166,13 +167,14 @@ def test_generate():
         model_path=model_path,
         texts=input_texts,
         use_official_tokenizer=True,
-        model_save_path='best_model.pth',
+        model_save_path="best_model.pth",
     )
 
     for input_text, output_text in zip(input_texts, outputs):
         print(f"Input: {input_text}")
         print(f"Output: {output_text}")
         print("-" * 50)
+
 
 if __name__ == "__main__":
     # test_train_tokenizer()

@@ -1,7 +1,8 @@
 from openai import OpenAI
 import re
 
-client = OpenAI(base_url="http://100.64.0.4:8080/v1", api_key="1234567890")
+# client = OpenAI(base_url="http://100.64.0.4:8080/v1", api_key="1234567890")
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="1234567890")
 
 MODEL = "Qwen3.5-27B-Opus4.6-Q4_K_M.gguf"
 
