@@ -35,16 +35,16 @@ NodeName = Literal[
     "end",
 ]
 
-MODEL_PRIMARY = os.getenv("OPENAI_MODEL", "Qwen3.5-35B-A3B-UD-Q4_K_L.gguf")
+MODEL_PRIMARY = os.getenv("OPENAI_MODEL", "Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf")
 MODEL_FALLBACK = os.getenv("OPENAI_MODEL_FALLBACK", "Qwen2.5-14B-Instruct")
-# BASE_URL = os.getenv("OPENAI_BASE_URL", "http://100.64.0.4:8080/v1")
-BASE_URL = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8080/v1")
+BASE_URL = os.getenv("OPENAI_BASE_URL", "http://100.64.0.4:8080/v1")
+# BASE_URL = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8080/v1")
 API_KEY = os.getenv("OPENAI_API_KEY", "sk-sp-aa6a935d0d864e1c910cbe757e162fdc")
 
-MODEL_PRIMARY = os.getenv("OPENAI_MODEL", "glm-5")
-MODEL_FALLBACK = os.getenv("OPENAI_MODEL_FALLBACK", "Qwen2.5-14B-Instruct")
-BASE_URL = os.getenv("OPENAI_BASE_URL", "https://coding.dashscope.aliyuncs.com/v1")
-API_KEY = os.getenv("OPENAI_API_KEY", "sk-sp-aa6a935d0d864e1c910cbe757e162fdc")
+# MODEL_PRIMARY = os.getenv("OPENAI_MODEL", "glm-5")
+# MODEL_FALLBACK = os.getenv("OPENAI_MODEL_FALLBACK", "Qwen2.5-14B-Instruct")
+# BASE_URL = os.getenv("OPENAI_BASE_URL", "https://coding.dashscope.aliyuncs.com/v1")
+# API_KEY = os.getenv("OPENAI_API_KEY", "sk-sp-aa6a935d0d864e1c910cbe757e162fd")
 
 client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
 
