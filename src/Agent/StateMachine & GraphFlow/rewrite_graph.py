@@ -10,6 +10,7 @@ class State(TypedDict):
     intent: str  # 意图识别结果
     confidence: float  # 意图置信度
     tool_result: Optional[dict[str, Any]]  # 工具调用的结果
+    messages: List[dict[str, Any]]  # 消息列表
     draft: str  # 生成的草稿
     answer: str  # 最终返回给用户的答案
     rejected: bool  # 是否触发了安全审核
