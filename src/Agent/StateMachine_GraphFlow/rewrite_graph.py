@@ -6,15 +6,12 @@ from openai import OpenAI
 
 # 1. 定义状态 (State)
 class State(TypedDict):
-    user_input: str  # 用户输入的原始文本
-    intent: str  # 意图识别结果
-    confidence: float  # 意图置信度
-    tool_result: Optional[dict[str, Any]]  # 工具调用的结果
-    messages: List[dict[str, Any]]  # 消息列表
-    draft: str  # 生成的草稿
-    answer: str  # 最终返回给用户的答案
-    rejected: bool  # 是否触发了安全审核
-    trace: List[str]  # 运行轨迹（用于调试）
+    user_input: str                       # 用户输入的原始文本
+    messages: List[dict[str, Any]]        # 对话历史 (OpenAI 格式)
+    tool_calls: List[dict[str, Any]]      # 模型返回的 tool_call 列表
+    answer: str                           # 最终返回给用户的答案
+    done: bool                            # 是否结束
+    trace: List[str]                      # 运行轨迹（用于调试）
 
 
 NodeFunc = Callable[[State], None]
@@ -40,7 +37,7 @@ class GraphFlow:
         self.end_node_name: Optional[str] = None
         self.nodes_dict: dict[str, Node] = {}
 
-    def run(self, state: State, max_steps: int):
+    def run(self, state: State, max_steps: int)->State:
         if self.start_node_name is None:
             raise ValueError("start_node_name is not set")
 
@@ -53,14 +50,21 @@ class GraphFlow:
                 raise ValueError(f"Node '{current_node_name}' not found")
 
             step += 1
+            state["trace"].append(f"-> {current_node_name}")
             node.func(state)
+
+            # 找下一个满足条件的边
+            next_node = None
             for edge in node.edges:
                 if edge.condition(state):
-                    current_node_name = edge.target_node_name
+                    next_node = edge.target_node_name
                     break
 
-            if current_node_name == self.end_node_name:
+            if next_node is None:
+                # 没有边能走了，流程自然结束
                 break
+
+            current_node_name = next_node
 
         return state
 
