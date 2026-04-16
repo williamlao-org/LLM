@@ -17,8 +17,9 @@ from .rewrite_tools import TOOLS, execute_tool
 
 from openai import OpenAI
 
-client = OpenAI(base_url="https://api.siliconflow.cn/v1", api_key="sk-ougrusqbfdllgscdzvlaknmfcothjdevxgdsxjzmvopvinhtlff")
-MODEL = "zai-org/GLM-4.6"
+client = OpenAI(base_url="https://api.siliconflow.cn/v1", api_key="sk-")
+client = OpenAI(base_url="https://new.samerwang.dpdns.org/v1", api_key="sk-")
+MODEL = "glm-5"
 
 
 # ============================================================

@@ -42,6 +42,7 @@ def build_agent() -> GraphFlow:
     g.add_edge("tool_exec", "llm")
 
     # reject 没有出边 → 图自动停
+    # reject 不加边,run 执行到 reject 节点后, _resolve_next 返回的 next_node 为 None, 循环结束
 
     g.set_start("entry")
     return g
