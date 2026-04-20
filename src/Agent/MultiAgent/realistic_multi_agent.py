@@ -15,7 +15,8 @@ from typing import Any, TypedDict
 from openai import OpenAI
 
 # 引用我们之前写的图引擎
-from StateMachine_GraphFlow.rewrite_graph import GraphFlow, END
+from Agent.StateMachine_GraphFlow.rewrite_graph import GraphFlow, END
+
 
 BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.siliconflow.cn/v1")
 API_KEY = os.getenv("OPENAI_API_KEY", "sk-")
