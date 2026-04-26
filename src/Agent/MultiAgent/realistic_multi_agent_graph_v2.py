@@ -569,7 +569,6 @@ def make_state(task: TaskSpec, max_rounds: int = 4) -> MultiAgentV2State:
         "final_code": "",
     }
 
-
 def build_default_task(task_text: str) -> TaskSpec:
     return TaskSpec(
         objective=task_text,
