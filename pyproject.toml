@@ -12,6 +12,7 @@ dependencies = [
     "tokenizers>=0.22.2",
     "scikit-learn>=1.7.2",
     "openai>=2.29.0",
+    "dotenv>=0.9.9",
 ]
 
 [[tool.uv.index]]
