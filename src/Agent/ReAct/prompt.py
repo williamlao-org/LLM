@@ -1,11 +1,5 @@
-from dataclasses import dataclass
 import json
-import os
 
-from openai import OpenAI
-from dotenv import load_dotenv
-
-load_dotenv()
 
 SYSTEM_PROMPT = """
 You are an assistant.
@@ -34,17 +28,6 @@ Rules (explicit):
 If `final_answer` is not null, terminate; otherwise the system will execute the specified `tool_call` and return `tool_result` to you.
 """
 
-
-@dataclass
-class ToolCall:
-    name = str
-    arguments = dict
-
-
-def calculate(num1, num2):
-    return num1 + num2
-
-
 tools = [
     {
         "name": "calculate",
@@ -60,49 +43,4 @@ tools = [
     }
 ]
 
-tool_registry = {"calculate": calculate}
-
-messages = [
-    {
-        "role": "system",
-        "content": SYSTEM_PROMPT.format(
-            tools=json.dumps(tools, ensure_ascii=False, indent=2)
-        ),
-    },
-    {"role": "user", "content": "5+6等于多少？"},
-]
-
-
-client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"), base_url=os.getenv("OPENAI_BASE_URL")
-)
-
-while True:
-    resp = client.chat.completions.create(
-        messages=messages, stream=False, model=os.getenv("OPENAI_MODEL")
-    )
-
-    result = resp.choices[0].message.content
-    messages.append({"role": "assistant", "content": result})
-
-    data = json.loads(result)
-
-    if data.get("final_answer"):
-        break
-
-    tool_call = data.get("tool_call")
-    if tool_call:
-        tool_name = tool_call["name"]
-        tool_arg = tool_call["arguments"]
-
-        tool_fn = tool_registry.get(tool_name)
-        if tool_fn is None:
-            raise ValueError(f"Unknown tool: {tool_name}")
-
-        tool_result = tool_fn(**tool_arg)
-
-        messages.append(
-            {"role": "user", "content": json.dumps({"tool_result": tool_result})}
-        )
-
-print(json.dumps(messages, ensure_ascii=False, indent=2))
+print(json.dumps(tools,indent=2))
