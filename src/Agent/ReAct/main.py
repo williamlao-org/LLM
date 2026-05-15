@@ -1,9 +1,12 @@
 from dataclasses import dataclass
 import json
 import os
+from typing import Any, Callable
 
+import httpx
 from openai import OpenAI
 from dotenv import load_dotenv
+from sympy import content
 
 load_dotenv()
 
@@ -36,40 +39,100 @@ If `final_answer` is not null, terminate; otherwise the system will execute the 
 
 
 @dataclass
-class ToolCall:
-    name = str
-    arguments = dict
+class Tool:
+    name: str
+    description: str
+    parameters: dict
+    func: Callable[..., Any]
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
+        }
 
 
 def calculate(num1, num2):
     return num1 + num2
 
 
-tools = [
-    {
-        "name": "calculate",
-        "description": "Add two numbers and return the sum.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "num1": {"type": "number", "description": "The first number"},
-                "num2": {"type": "number", "description": "The second number"},
-            },
-            "required": ["num1", "num2"],
+def web_search(query: str, max_results):
+    resp = httpx.post(
+        url="https://api.tavily.com/search",
+        headers={
+            "Authorization": f"Bearer {os.environ['TAVILY_API_KEY']}",
+            "Content-Type": "application/json",
         },
-    }
-]
+        json={
+            "query": query,
+            "search_depth": "basic",
+            "include_answer": False,
+            "include_raw_content": False,
+            "max_results": max_results,
+        },
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
 
-tool_registry = {"calculate": calculate}
+    results = []
+    for item in data.get("results", []):
+        title = item.get("title", "")
+        url = item.get("url", "")
+        content = item.get("content", "")
+        results.append({"title": title, "snippet": content, "url": url})
+    return results
+
+
+tool_calculate = Tool(
+    name="calculate",
+    description="Add two numbers and return the sum.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "num1": {"type": "number", "description": "The first number"},
+            "num2": {"type": "number", "description": "The second number"},
+        },
+        "required": ["num1", "num2"],
+    },
+    func=calculate,
+)
+
+tool_websearch = Tool(
+    name="web_search",
+    description="Search the web for information about a query.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "The search query"},
+            "max_results": {
+                "type": "integer",
+                "description": "Maximum number of results to return",
+            },
+        },
+        "required": ["query", "max_results"],
+    },
+    func=web_search,
+)
+
+tools: list[Tool] = []
+
+tools.append(tool_calculate)
+tools.append(tool_websearch)
+
+tool_registry = {tool.name: tool.func for tool in tools}
 
 messages = [
     {
         "role": "system",
         "content": SYSTEM_PROMPT.format(
-            tools=json.dumps(tools, ensure_ascii=False, indent=2)
+            tools=json.dumps(
+                [tool.to_dict() for tool in tools], ensure_ascii=False, indent=2
+            )
         ),
     },
-    {"role": "user", "content": "5+6等于多少？"},
+    {"role": "user", "content": "5+6等于多少？还有查一查今天比特币价格"},
 ]
 
 
@@ -77,32 +140,78 @@ client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY"), base_url=os.getenv("OPENAI_BASE_URL")
 )
 
-while True:
-    resp = client.chat.completions.create(
-        messages=messages, stream=False, model=os.getenv("OPENAI_MODEL")
-    )
 
-    result = resp.choices[0].message.content
-    messages.append({"role": "assistant", "content": result})
-
-    data = json.loads(result)
-
-    if data.get("final_answer"):
-        break
-
-    tool_call = data.get("tool_call")
-    if tool_call:
-        tool_name = tool_call["name"]
-        tool_arg = tool_call["arguments"]
-
-        tool_fn = tool_registry.get(tool_name)
-        if tool_fn is None:
-            raise ValueError(f"Unknown tool: {tool_name}")
-
-        tool_result = tool_fn(**tool_arg)
-
-        messages.append(
-            {"role": "user", "content": json.dumps({"tool_result": tool_result})}
+def main(stream: bool = True):
+    reasoning_content = []
+    while True:
+        resp = client.chat.completions.create(
+            messages=messages, stream=False, model=os.getenv("OPENAI_MODEL")
         )
 
-print(json.dumps(messages, ensure_ascii=False, indent=2))
+        result = resp.choices[0].message.content
+        messages.append({"role": "assistant", "content": result})
+
+        reasoning_content.append(
+            {"reasoning_content": resp.choices[0].message.reasoning_content}
+        )
+
+        data = json.loads(result)
+
+        if data.get("final_answer"):
+            break
+
+        tool_call = data.get("tool_call")
+        if tool_call:
+            tool_name = tool_call["name"]
+            tool_arg = tool_call["arguments"]
+
+            tool_fn = tool_registry.get(tool_name)
+            if tool_fn is None:
+                raise ValueError(f"Unknown tool: {tool_name}")
+
+            tool_result = tool_fn(**tool_arg)
+
+            messages.append(
+                {"role": "user", "content": json.dumps({"tool_result": tool_result})}
+            )
+
+    print(json.dumps(messages, ensure_ascii=False, indent=2))
+    print(json.dumps(reasoning_content, ensure_ascii=False, indent=2))
+
+    while True:
+        resp = client.chat.completions.create(
+            messages=messages,
+            model=os.getenv("OPENAI_MODEL"),
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+
+        content=[]
+        reasoning_content=[]
+
+        for chunk in resp:
+            if not chunk.choices:
+                continue
+
+            delta = chunk.choices[0].delta
+
+            reasoning_piece = getattr(delta, "reasoning_content", None)
+            content_piece = delta.content or ""
+
+            if reasoning_piece:
+                reasoning_content.append(reasoning_piece)
+            
+            if content_piece:
+                print(content_piece,end='',flush=True)
+                content.append(content_piece)
+
+        content=''.join(content)
+        reasoning_content=''.join(reasoning_content)
+
+        # 检查tool
+        content=json.loads(content)
+        tool_call=content.get('tool_call')
+
+        if tool_call:
+            tool_name=tool_call[name]
+            toll_arguments=tool_call.arguments
