@@ -6,7 +6,6 @@ from typing import Any, Callable
 import httpx
 from openai import OpenAI
 from dotenv import load_dotenv
-from sympy import content
 
 load_dotenv()
 
@@ -142,41 +141,43 @@ client = OpenAI(
 
 
 def main(stream: bool = True):
-    reasoning_content = []
-    while True:
-        resp = client.chat.completions.create(
-            messages=messages, stream=False, model=os.getenv("OPENAI_MODEL")
-        )
+    # reasoning_content = []
+    # while True:
+    #     resp = client.chat.completions.create(
+    #         messages=messages, stream=False, model=os.getenv("OPENAI_MODEL")
+    #     )
 
-        result = resp.choices[0].message.content
-        messages.append({"role": "assistant", "content": result})
+    #     content = resp.choices[0].message.content
+    #     messages.append({"role": "assistant", "content": content})
 
-        reasoning_content.append(
-            {"reasoning_content": resp.choices[0].message.reasoning_content}
-        )
+    #     reasoning_content.append(
+    #         {"reasoning_content": resp.choices[0].message.reasoning_content}
+    #     )
 
-        data = json.loads(result)
+    #     data = json.loads(content)
 
-        if data.get("final_answer"):
-            break
+    #     if data.get("final_answer"):
+    #         break
 
-        tool_call = data.get("tool_call")
-        if tool_call:
-            tool_name = tool_call["name"]
-            tool_arg = tool_call["arguments"]
+    #     tool_call = data.get("tool_call")
+    #     if tool_call:
+    #         tool_name = tool_call["name"]
+    #         tool_arg = tool_call["arguments"]
 
-            tool_fn = tool_registry.get(tool_name)
-            if tool_fn is None:
-                raise ValueError(f"Unknown tool: {tool_name}")
+    #         tool_fn = tool_registry.get(tool_name)
+    #         if tool_fn is None:
+    #             raise ValueError(f"Unknown tool: {tool_name}")
 
-            tool_result = tool_fn(**tool_arg)
+    #         tool_result = tool_fn(**tool_arg)
 
-            messages.append(
-                {"role": "user", "content": json.dumps({"tool_result": tool_result})}
-            )
+    #         messages.append(
+    #             {"role": "user", "content": json.dumps({"tool_result": tool_result})}
+    #         )
 
-    print(json.dumps(messages, ensure_ascii=False, indent=2))
-    print(json.dumps(reasoning_content, ensure_ascii=False, indent=2))
+    # print(json.dumps(messages, ensure_ascii=False, indent=2))
+    # print(json.dumps(reasoning_content, ensure_ascii=False, indent=2))
+
+    reasoning_contents=[]
 
     while True:
         resp = client.chat.completions.create(
@@ -186,8 +187,8 @@ def main(stream: bool = True):
             stream_options={"include_usage": True},
         )
 
-        content=[]
-        reasoning_content=[]
+        content = []
+        reasoning_content = []
 
         for chunk in resp:
             if not chunk.choices:
@@ -200,18 +201,39 @@ def main(stream: bool = True):
 
             if reasoning_piece:
                 reasoning_content.append(reasoning_piece)
-            
+
             if content_piece:
-                print(content_piece,end='',flush=True)
+                print(content_piece, end="", flush=True)
                 content.append(content_piece)
 
-        content=''.join(content)
-        reasoning_content=''.join(reasoning_content)
+
+        content = "".join(content)
+        reasoning_content = "".join(reasoning_content)
+        reasoning_contents.append(reasoning_content)
+
+
+        content = json.loads(content)
+        if content.get('final_answer'):
+            break
 
         # 检查tool
-        content=json.loads(content)
-        tool_call=content.get('tool_call')
+        tool_call = content.get("tool_call")
 
         if tool_call:
-            tool_name=tool_call[name]
-            toll_arguments=tool_call.arguments
+            tool_name = tool_call["name"]
+            tool_arguments = tool_call["arguments"]
+
+            tool_fn = tool_registry.get(tool_name)
+            if tool_fn is None:
+                raise ValueError(f"Unknown tool:{tool_name}")
+
+            tool_result = tool_fn(**tool_arguments)
+
+            messages.append(
+                {"role": "user", "content": json.dumps({"tool_result": tool_result})}
+            )
+
+    print(json.dumps(messages,ensure_ascii=False,indent=2))
+    print(json.dumps(reasoning_contents,ensure_ascii=False,indent=2))
+
+main()
