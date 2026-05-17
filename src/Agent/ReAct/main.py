@@ -21,7 +21,7 @@ messages = [
             )
         ),
     },
-    {"role": "user", "content": "5+6等于多少？还有查一查今天比特币价格"},
+    {"role": "user", "content": "执行 python 代码  print(1/0)"},
 ]
 
 
@@ -29,7 +29,13 @@ client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY"), base_url=os.getenv("OPENAI_BASE_URL")
 )
 
-
+def llm_json_parser(llm_content:str):
+    start=llm_content.index('{')
+    end=llm_content.rindex('}')
+    if start == -1 or end == -1:
+        raise ValueError("Invalid JSON")
+    return json.loads(llm_content[start:end+1])
+    
 def main(stream: bool = True):
     reasoning_contents = []
 
@@ -73,12 +79,12 @@ def main(stream: bool = True):
 
         messages.append({"role": "assistant", "content": content})
 
-        content = json.loads(content)
-        if content.get("final_answer"):
+        content_json = llm_json_parser(content)
+        if content_json.get("final_answer"):
             break
 
         # 检查tool
-        tool_call = content.get("tool_call")
+        tool_call = content_json.get("tool_call")
 
         if tool_call:
             tool_name = tool_call["name"]
