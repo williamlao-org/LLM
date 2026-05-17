@@ -1,6 +1,3 @@
-import json
-
-
 SYSTEM_PROMPT = """
 You are an assistant.
 
@@ -27,20 +24,3 @@ Rules (explicit):
 
 If `final_answer` is not null, terminate; otherwise the system will execute the specified `tool_call` and return `tool_result` to you.
 """
-
-tools = [
-    {
-        "name": "calculate",
-        "description": "Add two numbers and return the sum.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "num1": {"type": "number", "description": "The first number"},
-                "num2": {"type": "number", "description": "The second number"},
-            },
-            "required": ["num1", "num2"],
-        },
-    }
-]
-
-print(json.dumps(tools,indent=2))
