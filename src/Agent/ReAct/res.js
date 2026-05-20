@@ -19,12 +19,19 @@ class MyPromise {
             this.callbacksRejected.forEach(fn => queueMicrotask(() => fn(e)))
         }
         try {
-            executor(resolve);
+            executor(resolve, reject);
         } catch (e) {
             reject(e);
         }
     }
     then(fnResolve, fnReject) {
+        function handleResult(result, resolve, reject) {
+            if (result instanceof MyPromise) {
+                result.then(resolve, reject);
+            } else {
+                resolve(result);
+            }
+        }
         return new MyPromise((resolve, reject) => {
             if (this.state === 'fulfilled') {
                 // 同样是 `.then()`，有时候 fn 同步执行，有时候异步执行。
@@ -33,28 +40,52 @@ class MyPromise {
                 // then 的回调永远异步执行，即使 Promise 已经 fulfilled 了。
 
                 queueMicrotask(() => {
-                    const result = fnResolve(this.value)
-                    resolve(result)
+                    try {
+                        const result = fnResolve(this.value)
+                        handleResult(result, resolve, reject);
+                    } catch (e) {
+                        reject(e)
+                    }
                 })
-                
+
             }
             else if (this.state === 'rejected') {
                 queueMicrotask(() => {
-                    const result = fnReject(this.value)
-                    resolve(result)
+                    try {
+                        const result = fnReject(this.value)
+                        handleResult(result, resolve, reject);
+                    } catch (e) {
+                        reject(e)
+                    }
                 })
             }
             else {
                 if (fnResolve)
                     this.callbacksFulfilled.push((value) => {
-                        const result = fnResolve(value)
-                        resolve(result)
+                        try {
+                            const result = fnResolve(value)
+                            handleResult(result, resolve, reject);
+                        } catch (e) {
+                            reject(e)
+                        }
+                    })
+                else
+                    this.callbacksFulfilled.push((value) => {
+                        resolve(value)
                     })
 
                 if (fnReject)
-                    this.callbacksRejected.push((reason) => {
-                        const result = fnReject(reason)
-                        resolve(result)
+                    this.callbacksRejected.push((err) => {
+                        try {
+                            const result = fnReject(err)
+                            handleResult(result, resolve, reject);
+                        } catch (e) {
+                            reject(e)
+                        }
+                    })
+                else
+                    this.callbacksRejected.push((err) => {
+                        reject(err)
                     })
             }
 
@@ -62,7 +93,7 @@ class MyPromise {
         )
     }
     catch(fnReject) {
-        this.then(undefined, fnReject)
+        return this.then(undefined, fnReject)
     }
 }
 
@@ -104,3 +135,14 @@ p3
     .then(v => {
         console.log("p3 third:", v);
     });
+
+p3
+    .then(v => {
+        throw new Error("炸了")
+    })
+    .then(v => {
+        console.log("这行不会执行")
+    })
+    .catch(e => {
+        console.log("捕获到:", e.message)  // 应该打印 "捕获到: 炸了"
+    })

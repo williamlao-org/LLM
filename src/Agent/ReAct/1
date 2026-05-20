@@ -1,0 +1,17 @@
+const resolve = (v) => {
+    if (this.state === 'pending') {
+        this.state = 'fulfilled'
+        this.value = v
+        this.callbacksFulfilled.forEach(fn => queueMicrotask(() => fn(v)))
+    }
+}
+const reject = (e) => {
+    this.state = 'rejected'
+    this.value = e
+    this.callbacksRejected.forEach(fn => queueMicrotask(() => fn(e)))
+}
+try {
+    executor(resolve,reject);
+} catch (e) {
+    reject(e);
+}
