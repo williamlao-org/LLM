@@ -9,6 +9,7 @@ import contextlib
 from dataclasses import dataclass
 from typing import Any, Callable
 
+
 @dataclass
 class Tool:
     name: str
@@ -55,31 +56,51 @@ def web_search(query: str, max_results):
         results.append({"title": title, "snippet": content, "url": url})
     return results
 
-def execute_python(code:str):
-    buffer=io.StringIO()
-    err_info=''
+
+def execute_python(code: str):
+    buffer = io.StringIO()
+    err_info = ""
     try:
         with contextlib.redirect_stdout(buffer):
             exec(code)
     except Exception as e:
-        err_info=traceback.format_exc()
-    
+        err_info = traceback.format_exc()
+
     if err_info:
-        return {
-            'ok':False,
-            'err':err_info,
-            'content':''
-        }
+        return {"ok": False, "err": err_info, "content": ""}
     else:
+        return {"ok": True, "err": "", "content": buffer.getvalue()}
+
+
+def http_request(
+    url: str,
+    method: str = "GET",
+    params: dict | None = None,
+    body: dict | str | None = None,
+    headers: dict | None = None,
+):
+    try:
+        kwargs = {"params": params, "headers": headers, "timeout": 20}
+        if isinstance(body, dict):
+            kwargs["json"] = body
+        elif isinstance(body, str):
+            kwargs["content"] = body
+
+        resp = httpx.request(method, url, **kwargs)
+
+        content_type = resp.headers.get("content-type", "")
+        if "application/json" in content_type:
+            resp_body = resp.json()
+        else:
+            resp_body = resp.text
+
         return {
-            'ok':True,
-            'err':'',
-            'content':buffer.getvalue()
+            "status_code": resp.status_code,
+            "body": resp_body,
         }
-    
-def http_request(url:str,method:str='GET',params:dict|str|None=None,body:dict|str|None=None,headers:dict|None=None):
-    resp=httpx.request(method,url,params=params,data=body,headers=headers)
-    return resp.json()
+    except Exception as e:
+        return {"status_code": None, "body": str(e)}
+
 
 calculate_tool = Tool(
     name="calculate",
@@ -125,8 +146,80 @@ execute_python_tool = Tool(
     func=execute_python,
 )
 
+http_request_tool = Tool(
+    name="http_request",
+    description="Make an HTTP request to a specified URL with given parameters, body, and headers.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "The URL to send the request to"},
+            "method": {
+                "type": "string",
+                "description": "The HTTP method to use",
+                "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+            },
+            "params": {
+                "type": "object",
+                "description": "The query parameters to include in the request",
+            },
+            "body": {
+                "type": ["object", "string"],
+                "description": "The body of the request, if applicable",
+            },
+            "headers": {
+                "type": "object",
+                "description": "The headers to include in the request",
+            },
+        },
+        "required": ["url", "method"],
+    },
+    func=http_request,
+)
+
+# 文件操作工具链
+from pathlib import Path
+
+WORKSPACE_DIR = Path(__file__).resolve().parent / "workspace"
+
+
+def _safe_path(path: str):
+    safe_path = (WORKSPACE_DIR / path).resolve()
+    if not safe_path.is_relative_to(WORKSPACE_DIR):
+        raise ValueError("Unsafe path")
+    return safe_path
+
+
+def list_files(directory: str="."):
+    try:
+        safe_directory = _safe_path(directory)
+        files = [entry.name for entry in safe_directory.iterdir() if entry.is_file()]
+        dirs = [entry.name for entry in safe_directory.iterdir() if entry.is_dir()]
+        return {"ok": True, "files": files, "dirs": dirs}
+    except Exception as e:
+        return {"ok": False, "err": str(e), "files": [], "dirs": []}
+
+
+
+list_files_tool = Tool(
+    name="list_files",
+    description="List all files in a specified directory.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "directory": {
+                "type": "string",
+                "description": "The directory to list files in",
+            },
+        },
+        "required": ["directory"],
+    },
+    func=list_files,
+)
+
 tools: list[Tool] = []
 
 tools.append(calculate_tool)
 tools.append(web_search_tool)
 tools.append(execute_python_tool)
+tools.append(http_request_tool)
+tools.append(list_files_tool)

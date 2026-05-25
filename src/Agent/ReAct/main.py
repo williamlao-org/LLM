@@ -1,5 +1,6 @@
 import json
 import os
+from .logger import get_logger
 
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -9,6 +10,7 @@ from .prompt import SYSTEM_PROMPT
 
 load_dotenv()
 
+logger = get_logger(__name__)
 
 tool_registry = {tool.name: tool.func for tool in tools}
 
@@ -21,7 +23,7 @@ messages = [
             )
         ),
     },
-    {"role": "user", "content": "执行 python 代码  print(1/0)"},
+    {"role": "user", "content": "执行 python 代码  print(1/0)，并且使用 web_search 工具搜索一下 2024 年的奥运会在哪里举办？还有对ifconfig.me这个网站发起一个http请求，获取一下你的公网IP地址。"},
 ]
 
 
@@ -100,8 +102,8 @@ def main(stream: bool = True):
                 {"role": "user", "content": json.dumps({"tool_result": tool_result})}
             )
 
-    print(json.dumps(messages, ensure_ascii=False, indent=2))
-    print(json.dumps(reasoning_contents, ensure_ascii=False, indent=2))
+    logger.info('完整的对话内容:\n %s', json.dumps(messages, ensure_ascii=False, indent=2))
+    logger.info("Reasoning contents:\n %s", json.dumps(reasoning_contents, ensure_ascii=False, indent=2))
 
 
 main()
