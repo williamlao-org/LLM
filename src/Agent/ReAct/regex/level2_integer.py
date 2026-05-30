@@ -10,30 +10,44 @@ Level 2: DFA - 识别整数字面量
   DEAD - 死状态(非法输入, 不可恢复)
 """
 
+from enum import Enum, auto
+
+
+class State(Enum):
+    S0 = auto()
+    S1 = auto()
+    S2 = auto()
+    DEAD = auto()
+
+
+class CharClass(Enum):
+    SIGN = auto()
+    DIGIT = auto()
+
 
 def classify(ch):
     """将字符分类，DFA不关心具体字符，只关心字符的'类别'"""
-    if ch in ('+', '-'):
-        return 'sign'
+    if ch in ("+", "-"):
+        return "sign"
     elif ch.isdigit():
-        return 'digit'
+        return "digit"
     else:
-        return 'other'
+        return "other"
 
 
 # 状态转移表
 transition = {
-    'S0':   {'sign': 'S1', 'digit': 'S2', 'other': 'DEAD'},
-    'S1':   {'sign': 'DEAD', 'digit': 'S2', 'other': 'DEAD'},
-    'S2':   {'sign': 'DEAD', 'digit': 'S2', 'other': 'DEAD'},
-    'DEAD': {'sign': 'DEAD', 'digit': 'DEAD', 'other': 'DEAD'},
+    "S0": {"sign": "S1", "digit": "S2", "other": "DEAD"},
+    "S1": {"sign": "DEAD", "digit": "S2", "other": "DEAD"},
+    "S2": {"sign": "DEAD", "digit": "S2", "other": "DEAD"},
+    "DEAD": {"sign": "DEAD", "digit": "DEAD", "other": "DEAD"},
 }
 
-accept_states = {'S2'}
+accept_states = {"S2"}
 
 
 def run_dfa(s):
-    state = 'S0'
+    state = "S0"
 
     for ch in s:
         cat = classify(ch)
@@ -45,20 +59,20 @@ def run_dfa(s):
 
 # 测试
 test_cases = [
-    ("123",   True),
-    ("0",     True),
-    ("-456",  True),
-    ("+789",  True),
-    ("",      False),
-    ("-",     False),
-    ("12.3",  False),
-    ("abc",   False),
-    ("--5",   False),
-    ("+",     False),
+    ("123", True),
+    ("0", True),
+    ("-456", True),
+    ("+789", True),
+    ("", False),
+    ("-", False),
+    ("12.3", False),
+    ("abc", False),
+    ("--5", False),
+    ("+", False),
     ("42abc", False),
 ]
 
-print("="*40)
+print("=" * 40)
 for s, expected in test_cases:
     print(f"\n输入: '{s}'")
     result = run_dfa(s)
