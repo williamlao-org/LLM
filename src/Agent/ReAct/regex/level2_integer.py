@@ -23,34 +23,79 @@ class State(Enum):
 class CharClass(Enum):
     SIGN = auto()
     DIGIT = auto()
+    OTHER = auto()
+
+    @classmethod
+    def classify(cls, ch: str) -> "CharClass":
+        """将字符分类:DFA 只关心字符的'类别',不关心具体字符"""
+        if ch in ("+", "-"):
+            return cls.SIGN
+        elif ch.isdigit():
+            return cls.DIGIT
+        else:
+            return cls.OTHER
 
 
-def classify(ch):
-    """将字符分类，DFA不关心具体字符，只关心字符的'类别'"""
-    if ch in ("+", "-"):
-        return "sign"
-    elif ch.isdigit():
-        return "digit"
-    else:
-        return "other"
+def validate_dfa(
+    initial_state: State,
+    accept_states: set[State],
+    transition: dict[State, dict[CharClass, State]],
+):
+    if initial_state not in State:
+        raise ValueError("初始状态不合法")
+
+    for accept_state in accept_states:
+        if accept_state not in State:
+            raise ValueError(f"接收状态 {accept_state} 不合法")
+
+    for state in State:
+        if state not in transition.keys():
+            raise ValueError(f"transition 没有定义状态 {state}")
+
+        for char in CharClass:
+            to_states = transition[state]
+            if char not in to_states.keys():
+                raise ValueError(f"transition 没有定义状态 {state} 接收 {char} 的去向")
+            # if to_states[char] not in State:
+            if not isinstance(to_states[char], State):
+                raise ValueError(
+                    f"transition 定义状态 {state} 接收 {char} 时跳转到非法状态 {to_states[char]}"
+                )
 
 
 # 状态转移表
 transition = {
-    "S0": {"sign": "S1", "digit": "S2", "other": "DEAD"},
-    "S1": {"sign": "DEAD", "digit": "S2", "other": "DEAD"},
-    "S2": {"sign": "DEAD", "digit": "S2", "other": "DEAD"},
-    "DEAD": {"sign": "DEAD", "digit": "DEAD", "other": "DEAD"},
+    State.S0: {
+        CharClass.SIGN: State.S1,
+        CharClass.DIGIT: State.S2,
+        CharClass.OTHER: State.DEAD,
+    },
+    State.S1: {
+        CharClass.SIGN: State.DEAD,
+        CharClass.DIGIT: State.S2,
+        CharClass.OTHER: State.DEAD,
+    },
+    State.S2: {
+        CharClass.SIGN: State.DEAD,
+        CharClass.DIGIT: State.S2,
+        CharClass.OTHER: State.DEAD,
+    },
+    State.DEAD: {
+        CharClass.SIGN: State.DEAD,
+        CharClass.DIGIT: State.DEAD,
+        CharClass.OTHER: State.DEAD,
+    },
 }
-
-accept_states = {"S2"}
+initial_state = State.S0
+accept_states = {State.S2}
+validate_dfa(initial_state, accept_states, transition)
 
 
 def run_dfa(s):
-    state = "S0"
+    state = initial_state
 
     for ch in s:
-        cat = classify(ch)
+        cat = CharClass.classify(ch)
         state = transition[state][cat]
         print(f"  读入 '{ch}' (类别:{cat}) -> 状态 {state}")
 
