@@ -79,27 +79,35 @@ def http_request(
     body: dict | str | None = None,
     headers: dict | None = None,
 ):
+    # params 是 GET 的
+    kwargs: dict[str, Any] = {"params": params, "headers": headers, "timeout": 20}
+
+    # body 是 POST 的，根据 body 格式选择是Content-Type: application/json还是原始字符串
+    if isinstance(body, dict):
+        kwargs["json"] = body
+    elif isinstance(body, str):
+        kwargs["content"] = body
+
+    resp = httpx.request(method, url, **kwargs)
+    resp.raise_for_status()
+
+    content_type = resp.headers.get("content-type", "")
     try:
-        kwargs = {"params": params, "headers": headers, "timeout": 20}
-        if isinstance(body, dict):
-            kwargs["json"] = body
-        elif isinstance(body, str):
-            kwargs["content"] = body
+        body = resp.json() if "application/json" in content_type else resp.text
+    except Exception:
+        body = resp.text
 
-        resp = httpx.request(method, url, **kwargs)
+    if isinstance(body, str) and len(body) > 4000:
+        body = body[:4000]
+        truncated = True
+    else:
+        truncated = False
 
-        content_type = resp.headers.get("content-type", "")
-        if "application/json" in content_type:
-            resp_body = resp.json()
-        else:
-            resp_body = resp.text
-
-        return {
-            "status_code": resp.status_code,
-            "body": resp_body,
-        }
-    except Exception as e:
-        return {"status_code": None, "body": str(e)}
+    return {
+        "ok": True,
+        "err": "",
+        "response": body,
+    }
 
 
 calculate_tool = Tool(
@@ -189,7 +197,7 @@ def _safe_path(path: str):
     return safe_path
 
 
-def list_files(directory: str="."):
+def list_files(directory: str = "."):
     try:
         safe_directory = _safe_path(directory)
         files = [entry.name for entry in safe_directory.iterdir() if entry.is_file()]
@@ -197,7 +205,6 @@ def list_files(directory: str="."):
         return {"ok": True, "files": files, "dirs": dirs}
     except Exception as e:
         return {"ok": False, "err": str(e), "files": [], "dirs": []}
-
 
 
 list_files_tool = Tool(

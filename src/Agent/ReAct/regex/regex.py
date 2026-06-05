@@ -109,6 +109,8 @@ def match(pattern: str, text: str) -> bool:
             return match(pattern[1:], text[1:])
         return False
 
+    return False
+
 
 if __name__ == "__main__":
     # 括号 + |

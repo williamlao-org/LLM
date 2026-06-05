@@ -1,182 +1,212 @@
-StateId = int
-Char = str | None
 EPS = None
+
+State = int
+Symbol = str | None
+Transition = dict[State, dict[Symbol, set[State]]]
 
 
 class Frag:
-    def __init__(
-        self,
-        start_id: StateId,
-        accept_id: StateId,
-    ) -> None:
-        self.start_id = start_id
-        self.accept_id = accept_id
+    def __init__(self, start: State, accept: State):
+        self.start = start
+        self.accept = accept
 
 
 class Builder:
-    def __init__(self) -> None:
-        self.transition: dict[StateId, dict[Char, set[StateId]]] = {}
-        self._next_state_id = 0
+    def __init__(self):
+        self.transition: Transition = {}
+        self._next_state: State = 0
 
-    def new_state(self) -> StateId:
-        state_id = self._next_state_id
-        self._next_state_id += 1
-        self.transition[state_id] = {}
-        return state_id
+    def _new_state(self) -> State:
+        state = self._next_state
+        self.transition[state] = {}
+        self._next_state += 1
+        return state
 
-    def add_edge(self, frm_id: StateId, char: Char, to_id: StateId):
-        self.transition[frm_id].setdefault(char, set()).add(to_id)
+    def _add_edge(self, frm: State, to: State, char: Symbol = EPS):
+        self.transition[frm].setdefault(char, set()).add(to)
 
-    def lit(self, char: str) -> Frag:
-        start_id = self.new_state()
-        accept_id = self.new_state()
-        self.add_edge(start_id, char, accept_id)
-        return Frag(start_id, accept_id)
+    def lit(self, char: Symbol) -> Frag:
+        start = self._new_state()
+        accept = self._new_state()
 
-    def concat(self, left_frag: Frag, right_frag: Frag) -> Frag:
-        self.add_edge(left_frag.accept_id, EPS, right_frag.start_id)
-        return Frag(left_frag.start_id, right_frag.accept_id)
+        self._add_edge(start, accept, char)
 
-    def union(self, left_frag: Frag, right_frag: Frag) -> Frag:
-        start_id = self.new_state()
-        accept_id = self.new_state()
-        self.add_edge(start_id, EPS, left_frag.start_id)
-        self.add_edge(start_id, EPS, right_frag.start_id)
-        self.add_edge(left_frag.accept_id, EPS, accept_id)
-        self.add_edge(right_frag.accept_id, EPS, accept_id)
-        return Frag(start_id, accept_id)
+        return Frag(start, accept)
+
+    def concat(self, left: Frag, right: Frag) -> Frag:
+        start = self._new_state()
+        accept = self._new_state()
+
+        self._add_edge(left.accept, right.start)
+        self._add_edge(start, left.start)
+        self._add_edge(right.accept, accept)
+
+        return Frag(start, accept)
+
+    def union(self, up: Frag, down: Frag) -> Frag:
+        start = self._new_state()
+        accept = self._new_state()
+
+        self._add_edge(start, up.start)
+        self._add_edge(start, down.start)
+        self._add_edge(up.accept, accept)
+        self._add_edge(down.accept, accept)
+
+        return Frag(start, accept)
 
     def star(self, frag: Frag) -> Frag:
-        start_id = self.new_state()
-        accept_id = self.new_state()
-        self.add_edge(start_id, EPS, frag.start_id)
-        self.add_edge(frag.accept_id, EPS, frag.start_id)
-        self.add_edge(frag.accept_id, EPS, accept_id)
-        self.add_edge(start_id, EPS, accept_id)
+        start = self._new_state()
+        accept = self._new_state()
 
-        return Frag(start_id, accept_id)
+        self._add_edge(start, frag.start)
+        self._add_edge(frag.accept, accept)
+        # 重复读
+        self._add_edge(frag.accept, frag.start)
+        # 不读
+        self._add_edge(start, accept)
+
+        return Frag(start, accept)
 
     def compile(self, frag: Frag) -> "NFA":
-        # 拷贝转移表，编译出的 NFA 不再受后续 builder 操作影响
-        transition = {
-            state: {char: set(targets) for char, targets in edges.items()}
-            for state, edges in self.transition.items()
-        }
-        # transition=copy.deepcopy(self,transition) 无脑且正确
-        return NFA(transition, frag.start_id, frag.accept_id)
+        return NFA(frag.start, frag.accept, self.transition)
 
 
 class NFA:
-    def __init__(
-        self,
-        transition: dict[StateId, dict[Char, set[StateId]]],
-        start_id: StateId,
-        accept_id: StateId,
-    ) -> None:
+    def __init__(self, start: State, accept: State, transition: Transition):
+        self.start = start
+        self.accept = accept
         self.transition = transition
-        self.start_id = start_id
-        self.accept_id = accept_id
 
-    def _eps_closure(self, states: set[StateId]) -> set[StateId]:
-        closure = set(states)
+    def _eps_closure(self, states: set[State]) -> set[State]:
+        current_states = set(states)
         stack = list(states)
+
         while stack:
             state = stack.pop()
-            for to_id in self.transition[state].get(EPS, ()):
-                if to_id not in closure:
-                    closure.add(to_id)
-                    stack.append(to_id)
-        return closure
+            eps_states = self.transition[state].get(EPS, frozenset())
+
+            new_states = eps_states - current_states
+            current_states.update(new_states)
+            stack.extend(new_states)
+
+        return current_states
 
     def run(self, text: str) -> bool:
-        current_states = self._eps_closure({self.start_id})
+        current_states = self._eps_closure({self.start})
+
         for char in text:
-            next_states = set()
-            for state in current_states:
-                next_states.update(self.transition[state].get(char, ()))
+            # 接收字符，所有状态并进
+            nxt_states: set[State] = set()
+            for frm_state in current_states:
+                to_states = self.transition[frm_state].get(char, ())
+                nxt_states.update(to_states)
 
-            current_states = self._eps_closure(next_states)
-        return self.accept_id in current_states
+            # 状态机推导出所有状态
+            current_states = self._eps_closure(nxt_states)
 
-
-builder = Builder()
-frag_a = builder.lit("a")
-frag_ab = builder.concat(builder.lit("a"), builder.lit("b"))
-frag_a_or_ab = builder.union(frag_a, frag_ab)
-regex = builder.star(frag_a_or_ab)
-
-nfa = builder.compile(regex)
-print(nfa.run("ababab"))
+        return self.accept in current_states
 
 
+# builder = Builder()
+# frag_a = builder.lit("a")
+# frag_b = builder.lit("b")
+# frag_ab = builder.concat(frag_a, frag_b)
+# frag_a_or_ab = builder.union(builder.lit("a"), frag_ab)  # a|ab
+# regex = builder.star(frag_a_or_ab)
+
+# nfa = builder.compile(regex)
+# r = nfa.run("ababababaab")
+# print(r)
+
+
+# (a|ab)*ab
+# lit -> star -> concat -> union
 class Parser:
-    def __init__(self, pattern: str, builder: Builder) -> None:
+    def __init__(self, pattern: str, builder: Builder):
         self.pattern = pattern
-        self.pos = 0  # 当前读到哪个位置
         self.builder = builder
+        self.pos = 0
 
     def peek(self) -> str | None:
-        # 偷看当前字符，但不移动游标；到末尾了就返回 None
         if self.pos < len(self.pattern):
             return self.pattern[self.pos]
         return None
 
-    def eat(self) -> str:
-        # 吃掉当前字符，游标往后挪一位，并把这个字符返回
-        char = self.pattern[self.pos]
+    def advance(self) -> str:
+        ch = self.pattern[self.pos]
         self.pos += 1
-        return char
+        return ch
 
+    # lit
     def atom(self) -> Frag:
-        char = self.peek()
-        if char == "(":
-            self.eat()  # 吃掉 '('
-            frag = self.expr()  # 括号里面又是一个完整正则，跳回最外层
-            self.eat()  # 吃掉 ')'
+        # 有括号
+        if self.peek() == "(":
+            self.advance()
+            frag = self.expr()
+            self.advance()  # 吃掉 ")"
             return frag
-        else:
-            self.eat()  # 吃掉这个普通字符
-            return self.builder.lit(char)
 
-    def factor(self) -> Frag:
+        # 没括号
+        char = self.advance()
+        if not (char.isascii() and char.isalpha()):
+            raise ValueError(f"Unexpected char: {char} at pos {self.pos - 1}")
+
+        frag = self.builder.lit(char)
+        return frag
+
+    # star
+    def factor(self) -> Frag:  # star
         frag = self.atom()
+
         while self.peek() == "*":
-            # 为什么用 while 循环而不是一个 if？因为 a** 是合法的，意思是对 a 连续套两层 star。
-            self.eat()  # 吃掉 '*'
+            self.advance()
             frag = self.builder.star(frag)
+
         return frag
 
+    # concat
     def term(self) -> Frag:
-        frag = self.factor()
-        while self.peek() is not None and self.peek() not in ("|", ")"):
-            right = self.factor()
-            frag = self.builder.concat(frag, right)
-        return frag
+        left = self.factor()
 
+        char = self.peek()
+        while isinstance(char, str) and char.isascii() and char.isalpha():
+            # concat 没消耗任何符号，不需要advance
+
+            right = self.factor()
+            left = self.builder.concat(left, right)
+
+            char = self.peek()
+
+        return left
+
+    # union
     def expr(self) -> Frag:
-        frag = self.term()
+        up = self.term()
+
         while self.peek() == "|":
-            self.eat()  # 吃掉 '|'
-            right = self.term()
-            frag = self.builder.union(frag, right)
-        return frag
+            self.advance()
+            down = self.term()
+            up = self.builder.union(up, down)
+
+        return up
+
+    def parse(self) -> Frag:
+        regex = self.expr()
+
+        return regex
 
 
 def compile_regex(pattern: str) -> NFA:
     builder = Builder()
     parser = Parser(pattern, builder)
-    frag = parser.expr()
-    return builder.compile(frag)
+    regex = parser.parse()
+
+    nfa = builder.compile(regex)
+    return nfa
 
 
-nfa = compile_regex("(a|ab)*")
-print(nfa.run("ababab"))  # True
-print(nfa.run("aab"))  # True
-print(nfa.run("ba"))  # False
-print(nfa.run(""))  # True
+pattern = "(a|ab)*"
+nfa = compile_regex(pattern)
 
-# nfa = compile_regex("a|bc")
-# print(nfa.run("a"))    # True
-# print(nfa.run("bc"))   # True
-# print(nfa.run("ab"))   # False
-# print(nfa.run("b"))    # False
+r = nfa.run("ababaaababb")
+print(r)
