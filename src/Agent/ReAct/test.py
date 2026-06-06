@@ -12,9 +12,11 @@ import io
 
 
 
-from Agent.ReAct.tools import list_files
+from Agent.ReAct.tools import list_files,execute_command
 
 print(list_files())
 
 
 print(list_files("../workspace"))
+
+print(execute_command(['uname','-r']))

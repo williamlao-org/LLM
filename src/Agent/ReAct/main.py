@@ -44,7 +44,9 @@ messages: list[ChatCompletionMessageParam] = [
     # 用户的初始任务请求（包含多个子任务，用于测试 Agent 的多工具调用能力）
     {
         "role": "user",
-        "content": "执行 python 代码  print(1/0)，并且使用 web_search 工具搜索一下 2024 年的奥运会在哪里举办？还有对ifconfig.me这个网站发起一个http请求，获取一下你的公网IP地址。",
+        # "content": "执行 python 代码  print(1/0)，并且使用 web_search 工具搜索一下 2024 年的奥运会在哪里举办？还有对ifconfig.me这个网站发起一个http请求，获取一下你的公网IP地址。",
+        # "content": "看看当前工作区有哪些文件,看看文件中有什么内容，把其中的“我”改成“李建”，并新建一个贪吃蛇项目",
+        "content": "看看我电脑的详细情况，使用command工具",
     },
 ]
 

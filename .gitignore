@@ -45,4 +45,5 @@ outputs/
 
 .history/
 
-.env
+*.env
+.env*
