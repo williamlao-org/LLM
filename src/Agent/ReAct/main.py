@@ -18,6 +18,7 @@ from openai.types.chat import ChatCompletionMessageParam
 from dotenv import load_dotenv
 
 from .tools import tools  # 导入所有已注册的工具定义
+from .tools.base import ToolResult
 from .prompt import SYSTEM_PROMPT  # 导入系统提示词模板
 
 # 从 .env 文件加载环境变量（OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL 等）
@@ -79,6 +80,47 @@ def llm_json_parser(llm_content: str):
     return json.loads(llm_content[start : end + 1])
 
 
+def print_json_block(title: str, data):
+    print(f"\n\n===== {title} =====")
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+    print("====================\n")
+
+
+def execute_tool_call(tool_call: dict) -> ToolResult:
+    """查找并执行工具，返回标准化 tool_result"""
+
+    tool_name = tool_call["name"]  # 工具名称
+    tool_arguments = tool_call["arguments"]  # 工具参数
+
+    # 从注册表中查找对应的工具函数
+    tool_fn = tool_registry.get(tool_name)
+    if tool_fn is None:
+        return ToolResult.fail(err=f"Unknown tool:{tool_name}")
+
+    # 调用工具并获取结果（Observation）
+    try:
+        tool_result = tool_fn(**tool_arguments)
+    except Exception as e:
+        tool_result = ToolResult.fail(f"{type(e).__name__}: {e}")
+
+    return tool_result
+
+
+def build_tool_result_message(
+    tool_result: ToolResult | dict,
+) -> ChatCompletionMessageParam:
+    """把工具结果包装成下一轮给 LLM 的消息"""
+
+    if isinstance(tool_result, ToolResult):
+        tool_result = tool_result.to_dict()
+
+    msg: ChatCompletionMessageParam = {
+        "role": "user",
+        "content": json.dumps({"tool_result": tool_result}, ensure_ascii=False),
+    }
+    return msg
+
+
 def main(stream: bool = True):
     """
     ReAct Agent 的主循环。
@@ -125,6 +167,7 @@ def main(stream: bool = True):
                 content_piece = delta.content or ""
 
                 if reasoning_piece:
+                    print(reasoning_piece, end="", flush=True)
                     reasoning_content.append(reasoning_piece)
 
                 if content_piece:
@@ -147,11 +190,10 @@ def main(stream: bool = True):
             message = resp.choices[0].message
             content = message.content or ""
             reasoning_content = getattr(message, "reasoning_content", None)
+            print(content, flush=True)
 
         # 保存本轮推理内容，便于后续分析 LLM 的思考过程
         reasoning_contents.append(reasoning_content)
-
-        # 将 LLM 的回复追加到对话历史中，维护完整的上下文
         messages.append({"role": "assistant", "content": content})
 
         # ----- 步骤 3：解析 LLM 回复，判断下一步动作 -----
@@ -165,34 +207,22 @@ def main(stream: bool = True):
         tool_call = content_json.get("tool_call")
 
         if tool_call:
-            tool_name = tool_call["name"]  # 工具名称
-            tool_arguments = tool_call["arguments"]  # 工具参数
+            tool_result = execute_tool_call(tool_call)
+            tool_result_msg = build_tool_result_message(tool_result)
 
-            # 从注册表中查找对应的工具函数
-            tool_fn = tool_registry.get(tool_name)
-            if tool_fn is None:
-                raise ValueError(f"Unknown tool:{tool_name}")
+            print_json_block("Tool Result", tool_result)
 
-            # 调用工具并获取结果（Observation）
-            try:
-                tool_result = tool_fn(**tool_arguments)
-            except Exception as e:
-                tool_result = {"ok": False, "err": f"{type(e).__name__}: {e}"}
-
-            # ----- 步骤 5：将工具结果作为 "观察" 反馈给 LLM -----
-            # 以 user 角色追加，让 LLM 在下一轮推理时能看到工具的执行结果
-            messages.append(
-                {"role": "user", "content": json.dumps({"tool_result": tool_result})}
-            )
+        # ----- 步骤 5：将工具结果作为 "观察" 反馈给 LLM -----
+        messages.append(tool_result_msg)
 
     # ===== 循环结束，输出完整的对话记录和推理过程 =====
-    logger.info(
-        "完整的对话内容:\n %s", json.dumps(messages, ensure_ascii=False, indent=2)
-    )
-    logger.info(
-        "Reasoning contents:\n %s",
-        json.dumps(reasoning_contents, ensure_ascii=False, indent=2),
-    )
+    # logger.info(
+    #     "完整的对话内容:\n %s", json.dumps(messages, ensure_ascii=False, indent=2)
+    # )
+    # logger.info(
+    #     "Reasoning contents:\n %s",
+    #     json.dumps(reasoning_contents, ensure_ascii=False, indent=2),
+    # )
 
 
 main()

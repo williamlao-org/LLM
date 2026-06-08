@@ -1,22 +1,6 @@
-import traceback
-import contextlib
-import httpx
+from Agent.ReAct.tools import list_files_tool, execute_command_tool
 
-# from dotenv import load_dotenv
-import os
-import json
-import io
-
-# load_dotenv()
+print(list_files_tool.func("../workspace"))
 
 
-
-
-from Agent.ReAct.tools import list_files,execute_command
-
-print(list_files())
-
-
-print(list_files("../workspace"))
-
-print(execute_command(['uname','-r']))
+print(execute_command_tool.func("uname -r"))
