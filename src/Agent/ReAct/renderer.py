@@ -12,6 +12,8 @@
 两端职责清晰、互不依赖。
 """
 
+from Agent.ReAct.tools.base import ToolCall
+
 import json
 import sys
 from abc import ABC, abstractmethod
@@ -38,12 +40,12 @@ if sys.platform == "win32":
 class _Style:
     """ANSI 样式常量。用语义命名而非颜色名，方便统一调整配色。"""
 
-    DIM = "\033[2m"        # 暗淡：次要信息（参数、数据）
-    GRAY = "\033[90m"      # 灰：思考过程（弱化，区别于正式回答）
-    CYAN = "\033[36m"      # 青：回答标题
-    GREEN = "\033[32m"     # 绿：成功 / 最终答案
-    RED = "\033[31m"       # 红：失败
-    YELLOW = "\033[33m"    # 黄：工具调用
+    DIM = "\033[2m"  # 暗淡：次要信息（参数、数据）
+    GRAY = "\033[90m"  # 灰：思考过程（弱化，区别于正式回答）
+    CYAN = "\033[36m"  # 青：回答标题
+    GREEN = "\033[32m"  # 绿：成功 / 最终答案
+    RED = "\033[31m"  # 红：失败
+    YELLOW = "\033[33m"  # 黄：工具调用
     BOLD = "\033[1m"
     RESET = "\033[0m"
 
@@ -56,7 +58,7 @@ class Renderer(ABC):
     @abstractmethod
     def on_content_delta(self, piece: str) -> None: ...
     @abstractmethod
-    def on_tool_call(self, tool_call: dict) -> None: ...
+    def on_tool_call(self, tool_call: ToolCall | dict) -> None: ...
     @abstractmethod
     def on_tool_result(self, tool_result: "ToolResult | dict") -> None: ...
     @abstractmethod
@@ -75,7 +77,9 @@ class ConsoleRenderer(Renderer):
 
     # ----- 流式阶段管理 -----
 
-    def _start_phase(self, phase: str, title: str, title_style: str, body_style: str) -> None:
+    def _start_phase(
+        self, phase: str, title: str, title_style: str, body_style: str
+    ) -> None:
         """进入一个流式阶段：若是新阶段，先收尾上一个，再打标题并开启正文配色。"""
         if self._phase == phase:
             return
@@ -94,18 +98,20 @@ class ConsoleRenderer(Renderer):
     # ----- Renderer 接口实现 -----
 
     def on_reasoning_delta(self, piece: str) -> None:
-        self._start_phase("reasoning", "💭 思考", _Style.GRAY + _Style.BOLD, _Style.GRAY)
+        self._start_phase(
+            "reasoning", "💭 思考", _Style.GRAY + _Style.BOLD, _Style.GRAY
+        )
         print(piece, end="", flush=True)
 
     def on_content_delta(self, piece: str) -> None:
         self._start_phase("content", "💬 回答", _Style.CYAN + _Style.BOLD, "")
         print(piece, end="", flush=True)
 
-    def on_tool_call(self, tool_call: dict) -> None:
+    def on_tool_call(self, tool_call) -> None:
         self._end_stream()
-        name = tool_call.get("name")
+        name = tool_call.name
         print(f"\n{_Style.YELLOW}{_Style.BOLD}🔧 调用工具 › {name}{_Style.RESET}")
-        arguments = tool_call.get("arguments")
+        arguments = tool_call.arguments
         if arguments:
             body = json.dumps(arguments, ensure_ascii=False, indent=2)
             print(f"{_Style.DIM}{body}{_Style.RESET}", flush=True)
@@ -126,8 +132,10 @@ class ConsoleRenderer(Renderer):
 
     def on_final(self, answer) -> None:
         self._end_stream()
-        text = answer if isinstance(answer, str) else json.dumps(
-            answer, ensure_ascii=False, indent=2
+        text = (
+            answer
+            if isinstance(answer, str)
+            else json.dumps(answer, ensure_ascii=False, indent=2)
         )
         print(f"\n{_Style.GREEN}{_Style.BOLD}🎯 最终答案{_Style.RESET}")
         print(f"{_Style.GREEN}{text}{_Style.RESET}\n", flush=True)
@@ -138,6 +146,6 @@ class SilentRenderer(Renderer):
 
     def on_reasoning_delta(self, piece: str) -> None: ...
     def on_content_delta(self, piece: str) -> None: ...
-    def on_tool_call(self, tool_call: dict) -> None: ...
+    def on_tool_call(self, tool_call) -> None: ...
     def on_tool_result(self, tool_result) -> None: ...
     def on_final(self, answer) -> None: ...

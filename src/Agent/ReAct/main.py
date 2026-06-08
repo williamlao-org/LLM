@@ -18,7 +18,7 @@ from openai.types.chat import ChatCompletionMessageParam
 from dotenv import load_dotenv
 
 from .tools import tools  # 导入所有已注册的工具定义
-from .tools.base import ToolResult
+from .tools.base import ToolCall, ToolResult
 from .prompt import SYSTEM_PROMPT  # 导入系统提示词模板
 from .llm import call_llm  # 传输层：屏蔽流式/非流式差异，吐出事件流
 from .events import ReasoningDelta, ContentDelta, ContentDone  # 事件类型
@@ -60,7 +60,7 @@ client = OpenAI(
 )
 
 
-def llm_json_parser(llm_content: str):
+def llm_json_parser(llm_content: str) -> dict:
     """
     从 LLM 的回复文本中提取 JSON 对象。
 
@@ -83,11 +83,19 @@ def llm_json_parser(llm_content: str):
     return json.loads(llm_content[start : end + 1])
 
 
-def execute_tool_call(tool_call: dict) -> ToolResult:
+def route(content_json: dict):
+    if content_json.get("final_answer"):
+        return ("final", content_json["final_answer"])
+    if content_json.get("tool_call"):
+        return ("call", content_json["tool_call"])
+    raise ValueError("既不是 final_answer 也不是 tool_call")
+
+
+def execute_tool_call(tool_call: ToolCall) -> ToolResult:
     """查找并执行工具，返回标准化 tool_result"""
 
-    tool_name = tool_call["name"]  # 工具名称
-    tool_arguments = tool_call["arguments"]  # 工具参数
+    tool_name = tool_call.name  # 工具名称
+    tool_arguments = tool_call.arguments  # 工具参数
 
     # 从注册表中查找对应的工具函数
     tool_fn = tool_registry.get(tool_name)
@@ -136,7 +144,11 @@ def run_turn(model: str, stream: bool, renderer: Renderer) -> str:
     return content
 
 
-def main(stream: bool = True, renderer: Renderer | None = None):
+def main(
+    stream: bool = True,
+    renderer: Renderer | None = None,
+    max_steps: int = 25,
+):
     """
     ReAct Agent 的主循环（纯编排）。
 
@@ -146,35 +158,51 @@ def main(stream: bool = True, renderer: Renderer | None = None):
         3. 若是 tool_call，执行工具并把结果作为"观察"追加进 messages
         4. 回到步骤 1，开始下一轮推理
 
+    循环最多跑 max_steps 步，避免 LLM 始终不给 final_answer
+    （或反复吐出无法解析的内容）导致无限循环、持续烧 API 调用。
+
     Args:
         stream: 是否使用流式输出。为 True 时逐 token 打印，体验更好。
         renderer: 展示层。默认 ConsoleRenderer（终端实时输出）。
+        max_steps: 最大推理步数上限，防止死循环。
     """
     renderer = renderer or ConsoleRenderer()
     model = os.getenv("OPENAI_MODEL") or "gpt"
 
-    while True:
+    for _ in range(max_steps):
         # ----- 步骤 1：调用 LLM 推理（实时渲染由 renderer 完成）-----
         content = run_turn(model, stream, renderer)
         messages.append({"role": "assistant", "content": content})
 
         # ----- 步骤 2：解析回复，判断下一步动作 -----
-        content_json = llm_json_parser(content)
+        try:
+            content_json = llm_json_parser(content)
+            kind, payload = route(content_json)
 
-        # 若返回 final_answer，任务完成，结束循环
-        if content_json.get("final_answer"):
-            renderer.on_final(content_json["final_answer"])
-            break
+            # 若返回 final_answer，任务完成，结束循环
+            if kind == "final":
+                renderer.on_final(payload)
+                return
+
+            tool_call = ToolCall.from_dict(payload)
+        except (ValueError, KeyError) as e:
+            # 解析失败也是一种观察,喂回去让 LLM 重发
+            messages.append(
+                build_tool_result_message(ToolResult.fail(f"解析失败: {e}"))
+            )
+            continue
+
+        renderer.on_tool_call(tool_call)
 
         # ----- 步骤 3：执行工具调用（Action）-----
-        tool_call = content_json.get("tool_call")
-        if tool_call:
-            renderer.on_tool_call(tool_call)
-            tool_result = execute_tool_call(tool_call)
-            renderer.on_tool_result(tool_result)
+        tool_result = execute_tool_call(tool_call)
+        renderer.on_tool_result(tool_result)
 
-            # ----- 步骤 4：将工具结果作为"观察"反馈给 LLM -----
-            messages.append(build_tool_result_message(tool_result))
+        # ----- 步骤 4：将工具结果作为"观察"反馈给 LLM -----
+        messages.append(build_tool_result_message(tool_result))
+    else:
+        # 跑满 max_steps 仍未给出 final_answer：主动收尾，不伪装成功
+        renderer.on_final(f"已达到最大步数上限（{max_steps} 步），任务未完成。")
 
 
 main()
