@@ -187,8 +187,9 @@ def main(
             tool_call = ToolCall.from_dict(payload)
         except (ValueError, KeyError) as e:
             # 解析失败也是一种观察,喂回去让 LLM 重发
+            tool_result=ToolResult.fail(f'解析 tool_call 时失败：{e}')
             messages.append(
-                build_tool_result_message(ToolResult.fail(f"解析失败: {e}"))
+                build_tool_result_message(tool_result=tool_result)
             )
             continue
 
