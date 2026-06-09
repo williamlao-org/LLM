@@ -3,6 +3,9 @@ from pathlib import Path
 from .base import Tool, ToolResult
 
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent / "workspace"
+MAX_READ_CHARS = 1_000_000  # 单次最多读 100 万字符,够用又不撑爆内存
+
+MAX_READ_CHARS = 1_000_000  # 单次最多读 100 万字符,够用又不撑爆内存
 
 
 def _safe_path(path: str) -> Path:
@@ -28,6 +31,14 @@ def read_file(file: str, max_chars: int = 8000):
 
         if not safe_path.is_file():
             return ToolResult.fail("Not a file", data={"content": ""})
+
+        # max_chars 来自 LLM,可能是负数/字符串/小数/None。
+        # clamp 策略:不让这个参数本身导致失败,统一夹回 [0, 上限]。
+        try:
+            max_chars = int(max_chars)  # str("8000")、float(8000.0) 都试着转
+        except (ValueError, TypeError):
+            max_chars = 8000  # 转不动(None、乱字符串)-> 回默认
+        max_chars = max(0, min(max_chars, MAX_READ_CHARS))  # min 砍上限,max 托下限
 
         with open(safe_path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read(max_chars + 1)

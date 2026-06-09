@@ -134,7 +134,7 @@ def execute_tool_calls(
     不传则纯执行(无副作用,可单测);传了就能实时渲染进度。
     循环的所有权始终在本函数,渲染只是从插槽注入。
 
-    ### Explain 
+    ### Explain
     execute_tool_calls 想保持纯粹（可测、无副作用），但它跑的那个 for 循环又是渲染唯一能"实时插话"的地方。矛盾点在于：循环的所有权在执行函数手里，但渲染想在循环的每一步插一脚。 回调就是执行函数对外开的两个"插槽"——"我每调一个工具前/后，会喊一声，你想接就接，不接我照跑"。这样循环归执行函数独有（不重复），渲染从外部注入（不污染纯粹性）。
     """
     results: list[tuple[ToolCall, ToolResult]] = []
@@ -217,6 +217,8 @@ def main(
 
             if kind == "final":
                 renderer.on_final(payload)
+                print(json.dumps(messages, ensure_ascii=False, indent=2))
+
                 return
 
             # payload 是一组 raw tool_call dict。三步走:解析 → 执行(回调实时渲染) → 回传。
