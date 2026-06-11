@@ -23,7 +23,7 @@ def cpu_heavy(n):
 
 
 # 4 个一样的重计算任务
-TASKS = [20_000_000] * 4
+TASKS = [20_0000] * 4
 
 
 def run_serial():

@@ -21,88 +21,80 @@ from openai.types.chat import ChatCompletionMessageParam
 from .events import LLMEvent, ReasoningDelta, ContentDelta, ContentDone, UsageEvent
 
 
-def call_llm(
-    client: OpenAI,
-    messages: list[ChatCompletionMessageParam],
-    model: str,
-    stream: bool = True,
-) -> Iterator[LLMEvent]:
-    """调用一次 LLM，以事件流的形式产出结果。
+class LLMClient:
+    def __init__(self, client: OpenAI, model: str, stream: bool = True):
+        self.client = client
+        self.model = model
+        self.stream = stream
 
-    Args:
-        client: OpenAI 客户端（由调用方传入，便于测试与替换）
-        messages: 完整对话上下文
-        model: 模型名
-        stream: 是否走流式。无论真假，都必定以一个 ContentDone 收尾。
+    def __call__(
+        self,
+        messages: list[ChatCompletionMessageParam],
+    ) -> Iterator[LLMEvent]:
+        """调用一次 LLM，以事件流的形式产出结果。
 
-    Yields:
-        LLMEvent: ReasoningDelta / ContentDelta / ContentDone / UsageEvent
-    """
-    if stream:
-        yield from _call_stream(client, messages, model)
-    else:
-        yield from _call_once(client, messages, model)
+        Args:
+            client: OpenAI 客户端（由调用方传入，便于测试与替换）
+            messages: 完整对话上下文
+            model: 模型名
+            stream: 是否走流式。无论真假，都必定以一个 ContentDone 收   尾。
 
+        Yields:
+            LLMEvent: ReasoningDelta / ContentDelta /   ContentDone / UsageEvent
+        """
+        if self.stream:
+            yield from self._call_stream(messages)
+        else:
+            yield from self._call_once(messages)
 
-def _call_stream(
-    client: OpenAI,
-    messages: list[ChatCompletionMessageParam],
-    model: str,
-) -> Iterator[LLMEvent]:
-    """流式路径：逐 chunk 实时 yield Delta，最后汇总成 ContentDone。"""
-    resp = client.chat.completions.create(
-        messages=messages,
-        model=model,
-        stream=True,
-        stream_options={"include_usage": True},
-    )
+    def _call_stream(
+        self, messages: list[ChatCompletionMessageParam]
+    ) -> Iterator[LLMEvent]:
+        """流式路径：逐 chunk 实时 yield Delta，最后汇总成 ContentDone。"""
+        resp = self.client.chat.completions.create(
+            messages=messages,
+            model=self.model,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        content: list[str] = []
+        reasoning: list[str] = []
+        for chunk in resp:
+            # 最后一个携带 usage 的 chunk 通常没有 choices
+            if not chunk.choices:
+                if getattr(chunk, "usage", None):
+                    yield UsageEvent(chunk.usage)
+                continue
+            delta = chunk.choices[0].delta
+            # 部分模型（如 DeepSeek）会在 reasoning_content 里给出思维链
+            reasoning_piece = getattr(delta, "reasoning_content", None)
+            content_piece = delta.content or ""
+            # 关键：yield 写在 chunk 循环内部，token 一到就立刻交给上层渲染
+            if reasoning_piece:
+                reasoning.append(reasoning_piece)
+                yield ReasoningDelta(reasoning_piece)
+            if content_piece:
+                content.append(content_piece)
+                yield ContentDelta(content_piece)
+        # chunk 流结束：吐出完整内容，供主循环解析 JSON
+        yield ContentDone(content="".join(content), reasoning="".join(reasoning))
 
-    content: list[str] = []
-    reasoning: list[str] = []
+    def _call_once(
+        self,
+        messages: list[ChatCompletionMessageParam],
+    ) -> Iterator[LLMEvent]:
+        """非流式路径：一次性拿到完整响应，直接产出一个 ContentDone。"""
+        resp = self.client.chat.completions.create(
+            messages=messages,
+            model=self.model,
+            stream=False,
+        )
 
-    for chunk in resp:
-        # 最后一个携带 usage 的 chunk 通常没有 choices
-        if not chunk.choices:
-            if getattr(chunk, "usage", None):
-                yield UsageEvent(chunk.usage)
-            continue
+        message = resp.choices[0].message
+        content = message.content or ""
+        reasoning = getattr(message, "reasoning_content", None) or ""
 
-        delta = chunk.choices[0].delta
+        if getattr(resp, "usage", None):
+            yield UsageEvent(resp.usage)
 
-        # 部分模型（如 DeepSeek）会在 reasoning_content 里给出思维链
-        reasoning_piece = getattr(delta, "reasoning_content", None)
-        content_piece = delta.content or ""
-
-        # 关键：yield 写在 chunk 循环内部，token 一到就立刻交给上层渲染
-        if reasoning_piece:
-            reasoning.append(reasoning_piece)
-            yield ReasoningDelta(reasoning_piece)
-
-        if content_piece:
-            content.append(content_piece)
-            yield ContentDelta(content_piece)
-
-    # chunk 流结束：吐出完整内容，供主循环解析 JSON
-    yield ContentDone(content="".join(content), reasoning="".join(reasoning))
-
-
-def _call_once(
-    client: OpenAI,
-    messages: list[ChatCompletionMessageParam],
-    model: str,
-) -> Iterator[LLMEvent]:
-    """非流式路径：一次性拿到完整响应，直接产出一个 ContentDone。"""
-    resp = client.chat.completions.create(
-        messages=messages,
-        model=model,
-        stream=False,
-    )
-
-    message = resp.choices[0].message
-    content = message.content or ""
-    reasoning = getattr(message, "reasoning_content", None) or ""
-
-    if getattr(resp, "usage", None):
-        yield UsageEvent(resp.usage)
-
-    yield ContentDone(content=content, reasoning=reasoning)
+        yield ContentDone(content=content, reasoning=reasoning)

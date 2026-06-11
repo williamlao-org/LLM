@@ -21,6 +21,7 @@ from typing import Literal, Any, Callable
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from .logger import get_logger
 
 from openai import OpenAI
@@ -68,7 +69,7 @@ messages: list[ChatCompletionMessageParam] = [
 ]
 
 client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"), base_url=os.getenv("OPENAI_BASE_URL")
+    api_key=os.getenv("OPENAI_API_KEY"), base_url=os.getenv("OPENAI_BASE_URL"),
 )
 
 
@@ -148,6 +149,47 @@ def execute_tool_calls(
     return results
 
 
+def execute_tool_calls_parallel(
+    tool_calls: list[ToolCall],
+    on_call: Callable[[ToolCall], None] | None = None,
+    on_result: Callable[[ToolResult], None] | None = None,
+    max_workers: int = 8,
+) -> list[tuple[ToolCall, ToolResult]]:
+    """并行执行工具,返回 (call, result) 列表,顺序与输入 tool_calls 一致。
+
+    为什么用线程池而非进程池:工具(读写文件/跑命令/查网络)都是 I/O 密集,
+    等待时释放 GIL,线程足够;且进程池要求参数能 pickle,得不偿失。
+
+    并发但保序:每个 future 记住自己的原始下标,完工后按下标回填,
+    所以无论谁先跑完,返回顺序恒等于输入顺序——这是 OpenAI/Anthropic 的做法,
+    因为结果要按 tool_call.id 一一对应喂回给 LLM,顺序错模型就对不上号。
+
+    回调全在主线程跑(提交前调 on_call;as_completed 里按完成顺序调 on_result),
+    渲染器因此无需自己加锁。execute_tool_call 已把异常吞成 ToolResult.fail,
+    单个工具失败被隔离成一条错误结果,不会搞崩整轮。
+    """
+    if on_call:
+        for tool_call in tool_calls:
+            on_call(tool_call)
+
+    # 预留与输入等长的槽位,完工后按原始下标回填 → 保序
+    slots: list[tuple[ToolCall, ToolResult] | None] = [None] * len(tool_calls)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        fut_to_idx = {
+            pool.submit(execute_tool_call, tc): i for i, tc in enumerate(tool_calls)
+        }
+        # 谁先跑完谁先渲染(实时),但写回固定槽位(保序)
+        for fut in as_completed(fut_to_idx):
+            idx = fut_to_idx[fut]
+            result = fut.result()  # execute_tool_call 不抛异常,这里恒拿到 ToolResult
+            if on_result:
+                on_result(result)
+            slots[idx] = (tool_calls[idx], result)
+
+    return [slot for slot in slots if slot is not None]
+
+
 def run_turn(model: str, stream: bool, renderer: Renderer) -> str:
     """跑一轮 LLM 调用：实时渲染事件流，返回拼接好的完整 content。"""
     content = ""
@@ -224,7 +266,7 @@ def main(
             # payload 是一组 raw tool_call dict。三步走:解析 → 执行(回调实时渲染) → 回传。
             assert isinstance(payload, list)
             tool_calls = parse_tool_calls(payload)
-            results = execute_tool_calls(
+            results = execute_tool_calls_parallel(
                 tool_calls,
                 on_call=renderer.on_tool_call,
                 on_result=renderer.on_tool_result,
