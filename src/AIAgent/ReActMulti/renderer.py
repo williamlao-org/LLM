@@ -62,6 +62,9 @@ class Renderer(ABC):
     @abstractmethod
     def on_final(self, answer: Any) -> None: ...
 
+    def on_command_output(self, line: str) -> None:
+        """命令流式输出回调。默认不输出，子类按需覆盖。"""
+
 
 class ConsoleRenderer(Renderer):
     """终端渲染器：用颜色 + 图标对"思考 / 回答 / 工具 / 结论"做视觉分层。
@@ -113,6 +116,11 @@ class ConsoleRenderer(Renderer):
         if arguments:
             body = json.dumps(arguments, ensure_ascii=False, indent=2)
             print(f"{_Style.DIM}{body}{_Style.RESET}", flush=True)
+        if name == "execute_command":
+            print(f"{_Style.DIM}── 输出 ──{_Style.RESET}", flush=True)
+
+    def on_command_output(self, line: str) -> None:
+        print(f"{_Style.DIM}{line}{_Style.RESET}", end="", flush=True)
 
     def on_tool_result(self, tool_result) -> None:
         self._end_stream()

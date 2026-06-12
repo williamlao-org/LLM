@@ -5,7 +5,7 @@ from typing import Any
 from .base import Tool, ToolResult
 
 
-def web_search(query: str, max_results: int):
+def web_search(query: str, max_results: int, timeout: int = 20):
     resp = httpx.post(
         url="https://api.tavily.com/search",
         headers={
@@ -19,7 +19,7 @@ def web_search(query: str, max_results: int):
             "include_raw_content": False,
             "max_results": max_results,
         },
-        timeout=20,
+        timeout=timeout,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -39,8 +39,9 @@ def http_request(
     params: dict | None = None,
     body: dict | str | None = None,
     headers: dict | None = None,
+    timeout: int = 20,
 ):
-    kwargs: dict[str, Any] = {"params": params, "headers": headers, "timeout": 20}
+    kwargs: dict[str, Any] = {"params": params, "headers": headers, "timeout": timeout}
 
     if isinstance(body, dict):
         kwargs["json"] = body
