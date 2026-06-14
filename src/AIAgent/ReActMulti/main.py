@@ -26,12 +26,20 @@ if __name__ == "__main__":
     base_url = os.getenv("OPENAI_BASE_URL")
     api_key = os.getenv("OPENAI_API_KEY")
     model = os.getenv("OPENAI_MODEL")
+    context_limit_raw = os.getenv("OPENAI_CONTEXT_LIMIT")
+    context_limit = int(context_limit_raw) if context_limit_raw else None
 
-    llm_client = LLMClient(base_url=base_url, api_key=api_key, model=model)
+    llm_client = LLMClient(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        context_limit=context_limit or 2000,
+    )
     renderer = ConsoleRenderer()
 
-    agent = Agent(llm_client, tools, renderer)
+    agent = Agent(llm_client, tools, renderer,keep_recent_tool_results=1)
 
     agent.run(
-        "执行 python 代码 print(1/0)，并且用 web_search 搜索 2024 年奥运会在哪举办，再对 ifconfig.me/ip 发起 http 请求拿到公网 IP。"
+        # "执行 python 代码 print(1/0)，并且用 web_search 搜索 2024 年奥运会在哪举办，再对 ifconfig.me/ip 发起 http 请求拿到公网 IP。执行命令查看当前主机信息"
+        "执行命令查看当前主机信息，查看装了那些应用"
     )

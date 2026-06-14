@@ -30,6 +30,7 @@ class LLMClient:
         base_url: str | None,
         api_key: str | None,
         model: str | None,
+        context_limit: int | None = None,
         stream: bool = True,
         max_attempts: int = 3,
         base_wait: float = 1.0,
@@ -43,6 +44,7 @@ class LLMClient:
 
         self.client = OpenAI(base_url=base_url, api_key=api_key)
         self.model = model
+        self.context_limit = context_limit
         self.stream = stream
         self.max_attempts = max_attempts
         self.base_wait = base_wait
@@ -91,19 +93,19 @@ class LLMClient:
         content: list[str] = []
         reasoning: list[str] = []
         for chunk in resp:  # 走到这里说明连接已建立;中途断流让它往上抛
-            if not chunk.choices:
-                if getattr(chunk, "usage", None):
-                    yield UsageEvent(chunk.usage)
-                continue
-            delta = chunk.choices[0].delta
-            reasoning_piece = getattr(delta, "reasoning_content", None)
-            content_piece = delta.content or ""
-            if reasoning_piece:
-                reasoning.append(reasoning_piece)
-                yield ReasoningDelta(reasoning_piece)
-            if content_piece:
-                content.append(content_piece)
-                yield ContentDelta(content_piece)
+            usage = getattr(chunk, "usage", None)
+            if chunk.choices:
+                delta = chunk.choices[0].delta
+                reasoning_piece = getattr(delta, "reasoning_content", None)
+                content_piece = delta.content or ""
+                if reasoning_piece:
+                    reasoning.append(reasoning_piece)
+                    yield ReasoningDelta(reasoning_piece)
+                if content_piece:
+                    content.append(content_piece)
+                    yield ContentDelta(content_piece)
+            if usage:
+                yield UsageEvent(usage)
         yield ContentDone(content="".join(content), reasoning="".join(reasoning))
 
     def _call_once(

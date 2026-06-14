@@ -7,17 +7,51 @@ LLMClient 用假参数构造(不发起任何网络请求),整套测试离线可�
     python -m src.AIAgent.ReActMulti.test
 """
 
+import json
 import time
+from types import SimpleNamespace
 
 from .agent import Agent
+from .events import ContentDelta, ContentDone, UsageEvent
 from .llm import LLMClient
 from .renderer import SilentRenderer
 from .tools.base import Tool, ToolCall, ToolResult
 
 
-def _make_agent(tools: list[Tool], tool_timeout: float) -> Agent:
-    llm = LLMClient(base_url="http://x", api_key="sk-x", model="m")
-    return Agent(llm, tools, SilentRenderer(), tool_timeout=tool_timeout)
+class RecordingRenderer(SilentRenderer):
+    def __init__(self):
+        self.context_compacts = []
+
+    def on_context_compact(
+        self,
+        folded_count: int,
+        prompt_tokens: int | None,
+        context_limit: int | None,
+        context_watermark: float,
+    ) -> None:
+        self.context_compacts.append(
+            {
+                "folded_count": folded_count,
+                "prompt_tokens": prompt_tokens,
+                "context_limit": context_limit,
+                "context_watermark": context_watermark,
+            }
+        )
+
+
+def _make_agent(
+    tools: list[Tool], tool_timeout: float, keep_recent_tool_results: int = 3
+) -> Agent:
+    llm = LLMClient(
+        base_url="http://x", api_key="sk-x", model="m", context_limit=128_000
+    )
+    return Agent(
+        llm,
+        tools,
+        SilentRenderer(),
+        tool_timeout=tool_timeout,
+        keep_recent_tool_results=keep_recent_tool_results,
+    )
 
 
 def test_parallel_timeout_fills_fail():
@@ -73,8 +107,335 @@ def test_tool_exception_becomes_fail():
     assert "RuntimeError" in results[0][1].err
 
 
+def test_run_turn_records_usage():
+    """UsageEvent 要被 Agent 接住:上下文取最近值,输出 token 做累计。"""
+
+    class FakeLLM:
+        def __init__(self):
+            self.calls = 0
+            self.context_limit = 128_000
+
+        def __call__(self, messages):
+            self.calls += 1
+            yield ContentDone(content=f"content {self.calls}")
+            yield UsageEvent(
+                SimpleNamespace(
+                    prompt_tokens=100 * self.calls,
+                    completion_tokens=10 * self.calls,
+                    total_tokens=110 * self.calls,
+                )
+            )
+
+    agent = Agent(FakeLLM(), [], SilentRenderer(), tool_timeout=5)
+
+    assert agent._run_turn() == "content 1"
+    assert agent.last_prompt_tokens == 100
+    assert agent.last_completion_tokens == 10
+    assert agent.last_total_tokens == 110
+    assert agent.total_completion_tokens == 10
+
+    assert agent._run_turn() == "content 2"
+    assert agent.last_prompt_tokens == 200
+    assert agent.last_completion_tokens == 20
+    assert agent.last_total_tokens == 220
+    assert agent.total_completion_tokens == 30
+
+
+def test_run_turn_records_dict_usage():
+    """兼容 dict 形态的 usage,不少 OpenAI-compatible 接口会这样返回。"""
+
+    class FakeLLM:
+        context_limit = 128_000
+
+        def __call__(self, messages):
+            yield ContentDone(content="ok")
+            yield UsageEvent(
+                {
+                    "completion_tokens": 1541,
+                    "prompt_tokens": 11,
+                    "total_tokens": 1552,
+                    "completion_tokens_details": {
+                        "reasoning_tokens": 1426,
+                    },
+                    "prompt_tokens_details": {
+                        "cached_tokens": 0,
+                    },
+                    "prompt_cache_hit_tokens": 0,
+                    "prompt_cache_miss_tokens": 11,
+                }
+            )
+
+    agent = Agent(FakeLLM(), [], SilentRenderer(), tool_timeout=5)
+
+    assert agent._run_turn() == "ok"
+    assert agent.last_prompt_tokens == 11
+    assert agent.last_completion_tokens == 1541
+    assert agent.last_total_tokens == 1552
+    assert agent.total_completion_tokens == 1541
+
+
+def test_stream_usage_event_can_live_on_choice_chunk():
+    """兼容接口可能把 usage 挂在带 choices 的流式 chunk 上,不能漏读。"""
+
+    usage = SimpleNamespace(prompt_tokens=12, completion_tokens=3)
+    chunk = SimpleNamespace(
+        choices=[SimpleNamespace(delta=SimpleNamespace(content="hi"))],
+        usage=usage,
+    )
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            return iter([chunk])
+
+    llm = LLMClient.__new__(LLMClient)
+    llm.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=FakeCompletions())
+    )
+    llm.model = "fake-model"
+    llm.max_attempts = 1
+    llm.base_wait = 0
+    llm.max_wait = 0
+
+    events = list(llm._call_stream([{"role": "user", "content": "hello"}]))
+
+    assert isinstance(events[0], ContentDelta) and events[0].piece == "hi"
+    assert isinstance(events[1], UsageEvent)
+    assert isinstance(events[-1], ContentDone)
+
+
+def test_is_tool_result_message_only_accepts_valid_tool_results():
+    agent = _make_agent([], tool_timeout=5)
+
+    assert agent._is_tool_result_message(
+        {"role": "user", "content": json.dumps({"tool_results": []})}
+    )
+    assert not agent._is_tool_result_message(
+        {"role": "assistant", "content": json.dumps({"tool_results": []})}
+    )
+    assert not agent._is_tool_result_message({"role": "user", "content": "not json"})
+    assert not agent._is_tool_result_message(
+        {"role": "user", "content": json.dumps("tool_results")}
+    )
+    assert not agent._is_tool_result_message(
+        {"role": "user", "content": json.dumps({"tool_results": {}})}
+    )
+    assert not agent._is_tool_result_message({"role": "user", "content": None})
+
+
+def test_fold_old_tool_results_keeps_recent_and_roles():
+    agent = _make_agent([], tool_timeout=5, keep_recent_tool_results=2)
+
+    original_messages = list(agent.messages)
+    for i in range(5):
+        agent.messages.append(
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "tool_results": [
+                            {
+                                "id": f"call_{i}",
+                                "name": "read_file",
+                                "result": {
+                                    "ok": True,
+                                    "err": "",
+                                    "data": f"large result {i}",
+                                },
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                "_test_extra_field": f"keep {i}",
+            }
+        )
+        agent.messages.append({"role": "assistant", "content": f"assistant {i}"})
+
+    before_len = len(agent.messages)
+    before_roles = [msg["role"] for msg in agent.messages]
+
+    assert agent._fold_old_tool_results() == 3
+    assert len(agent.messages) == before_len
+    assert [msg["role"] for msg in agent.messages] == before_roles
+    assert agent.messages[: len(original_messages)] == original_messages
+
+    tool_result_messages = [
+        json.loads(msg["content"])
+        for msg in agent.messages
+        if agent._is_tool_result_message(msg)
+    ]
+
+    assert len(tool_result_messages) == 5
+
+    for folded in tool_result_messages[:3]:
+        assert folded["folded"] is True
+        result = folded["tool_results"][0]["result"]
+        assert result["ok"] is True
+        assert result["err"] == ""
+        assert result["data"] == "[旧工具结果已折叠以节省上下文]"
+
+    folded_messages = [
+        msg
+        for msg in agent.messages
+        if agent._is_tool_result_message(msg) and json.loads(msg["content"]).get("folded")
+    ]
+    assert [msg["_test_extra_field"] for msg in folded_messages] == [
+        "keep 0",
+        "keep 1",
+        "keep 2",
+    ]
+
+    for recent_idx, recent in enumerate(tool_result_messages[3:], start=3):
+        assert "folded" not in recent
+        assert recent["tool_results"][0]["result"]["data"] == f"large result {recent_idx}"
+
+
+def test_fold_old_tool_results_is_idempotent():
+    agent = _make_agent([], tool_timeout=5, keep_recent_tool_results=1)
+    for i in range(3):
+        agent.messages.append(
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "tool_results": [
+                            {
+                                "id": f"call_{i}",
+                                "name": "read_file",
+                                "result": {"ok": False, "err": f"err {i}", "data": "x"},
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        )
+
+    assert agent._fold_old_tool_results() == 2
+    after_first_fold = list(agent.messages)
+    assert agent._fold_old_tool_results() == 0
+    assert agent.messages == after_first_fold
+
+
+def _append_tool_result_message(agent: Agent, idx: int) -> None:
+    agent.messages.append(
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "tool_results": [
+                        {
+                            "id": f"call_{idx}",
+                            "name": "read_file",
+                            "result": {
+                                "ok": True,
+                                "err": "",
+                                "data": f"large result {idx}",
+                            },
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+        }
+    )
+
+
+def test_compact_context_if_needed_folds_and_reports():
+    renderer = RecordingRenderer()
+    llm = LLMClient(
+        base_url="http://x", api_key="sk-x", model="m", context_limit=100
+    )
+    agent = Agent(
+        llm,
+        [],
+        renderer,
+        tool_timeout=5,
+        context_watermark=0.75,
+        keep_recent_tool_results=2,
+    )
+    agent.last_prompt_tokens = 80
+    agent.last_total_tokens = 90
+    agent.last_completion_tokens = 10
+    agent.total_completion_tokens = 123
+
+    for i in range(5):
+        _append_tool_result_message(agent, i)
+
+    assert agent._compact_context_if_needed() == 3
+    assert agent.last_prompt_tokens is None
+    assert agent.last_total_tokens is None
+    assert agent.last_completion_tokens == 10
+    assert agent.total_completion_tokens == 123
+    assert renderer.context_compacts == [
+        {
+            "folded_count": 3,
+            "prompt_tokens": 80,
+            "context_limit": 100,
+            "context_watermark": 0.75,
+        }
+    ]
+
+
+def test_compact_context_if_needed_reports_when_nothing_to_fold():
+    renderer = RecordingRenderer()
+    llm = LLMClient(
+        base_url="http://x", api_key="sk-x", model="m", context_limit=100
+    )
+    agent = Agent(
+        llm,
+        [],
+        renderer,
+        tool_timeout=5,
+        context_watermark=0.75,
+        keep_recent_tool_results=3,
+    )
+    agent.last_prompt_tokens = 80
+    agent.last_total_tokens = 90
+
+    assert agent._compact_context_if_needed() == 0
+    assert agent.last_prompt_tokens == 80
+    assert agent.last_total_tokens == 90
+    assert renderer.context_compacts == [
+        {
+            "folded_count": 0,
+            "prompt_tokens": 80,
+            "context_limit": 100,
+            "context_watermark": 0.75,
+        }
+    ]
+
+
+def test_compact_context_if_needed_skips_below_watermark():
+    renderer = RecordingRenderer()
+    llm = LLMClient(
+        base_url="http://x", api_key="sk-x", model="m", context_limit=100
+    )
+    agent = Agent(
+        llm,
+        [],
+        renderer,
+        tool_timeout=5,
+        context_watermark=0.75,
+        keep_recent_tool_results=1,
+    )
+    agent.last_prompt_tokens = 75
+
+    assert agent._compact_context_if_needed() == 0
+    assert renderer.context_compacts == []
+
+
 if __name__ == "__main__":
     test_parallel_timeout_fills_fail()
     test_inner_timeout_clamped_to_budget()
     test_tool_exception_becomes_fail()
+    test_run_turn_records_usage()
+    test_run_turn_records_dict_usage()
+    test_stream_usage_event_can_live_on_choice_chunk()
+    test_is_tool_result_message_only_accepts_valid_tool_results()
+    test_fold_old_tool_results_keeps_recent_and_roles()
+    test_fold_old_tool_results_is_idempotent()
+    test_compact_context_if_needed_folds_and_reports()
+    test_compact_context_if_needed_reports_when_nothing_to_fold()
+    test_compact_context_if_needed_skips_below_watermark()
     print("all tests passed")

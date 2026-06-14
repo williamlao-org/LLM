@@ -8,7 +8,7 @@ from .util import (
 )
 from .prompt import SYSTEM_PROMPT
 from .renderer import Renderer
-from .events import ReasoningDelta, ContentDelta, ContentDone
+from .events import ReasoningDelta, ContentDelta, ContentDone, UsageEvent
 from .llm import LLMClient
 from .tools.base import Tool, ToolCall, ToolResult
 from openai.types.chat import ChatCompletionMessageParam
@@ -26,11 +26,22 @@ class Agent:
         tools: list[Tool],
         renderer: Renderer,
         tool_timeout: float = 30,
+        context_watermark: float = 0.75,
+        keep_recent_tool_results: int = 3,
     ):
         self.llm = llm
         self.tools = tools
         self.renderer = renderer
         self.tool_timeout = tool_timeout
+
+        # 用量属性
+        self.last_prompt_tokens: int | None = None
+        self.last_completion_tokens: int | None = None
+        self.last_total_tokens: int | None = None
+        self.total_completion_tokens: int = 0
+        self.context_limit = llm.context_limit
+        self.context_watermark = context_watermark
+        self.keep_recent_tool_results = keep_recent_tool_results
 
         self.messages: list[ChatCompletionMessageParam] = [
             {
@@ -43,6 +54,107 @@ class Agent:
             }
         ]
         self.tool_registry = {tool.name: tool.func for tool in tools}
+
+    def _context_over_watermark(self) -> bool:
+        if self.context_limit is None:
+            return False
+
+        if self.last_prompt_tokens is None:
+            return False
+
+        return self.last_prompt_tokens > self.context_limit * self.context_watermark
+
+    def _invalidate_context_usage(self) -> None:
+        """本地改写 messages 后,上一次 prompt/total token 读数已不再对应当前上下文。"""
+        self.last_prompt_tokens = None
+        self.last_total_tokens = None
+
+    def _is_tool_result_message(self, msg: ChatCompletionMessageParam) -> bool:
+        if msg.get("role") != "user":
+            return False
+
+        content = msg.get("content")
+        if not isinstance(content, str):
+            return False
+
+        try:
+            content_json = json.loads(content)
+        except json.JSONDecodeError:
+            return False
+
+        return isinstance(content_json, dict) and isinstance(
+            content_json.get("tool_results"), list
+        )
+
+    def _fold_old_tool_results(self) -> int:
+        """压缩旧工具结果,保留最近 keep_recent 条完整结果。"""
+        keep_recent = max(0, self.keep_recent_tool_results)
+        tool_result_indexes = [
+            idx
+            for idx, msg in enumerate(self.messages)
+            if self._is_tool_result_message(msg)
+        ]
+        indexes_to_fold = (
+            tool_result_indexes[:-keep_recent] if keep_recent else tool_result_indexes
+        )
+
+        folded_count = 0
+        for idx in indexes_to_fold:
+            msg = self.messages[idx]
+            content = msg.get("content")
+            if not isinstance(content, str):
+                continue
+
+            try:
+                content_json = json.loads(content)
+            except json.JSONDecodeError:
+                continue
+
+            if content_json.get("folded"):
+                continue
+
+            folded_results = []
+            for item in content_json["tool_results"]:
+                if not isinstance(item, dict):
+                    continue
+
+                result = item.get("result")
+                ok = result.get("ok", True) if isinstance(result, dict) else True
+                err = result.get("err", "") if isinstance(result, dict) else ""
+                folded_results.append(
+                    {
+                        "id": item.get("id"),
+                        "name": item.get("name"),
+                        "result": {
+                            "ok": ok,
+                            "err": err,
+                            "data": "[旧工具结果已折叠以节省上下文]",
+                        },
+                    }
+                )
+
+            self.messages[idx]["content"] = json.dumps(
+                {"tool_results": folded_results, "folded": True},
+                ensure_ascii=False,
+            )
+            folded_count += 1
+
+        return folded_count
+
+    def _compact_context_if_needed(self) -> int:
+        if not self._context_over_watermark():
+            return 0
+
+        folded_count = self._fold_old_tool_results()
+        self.renderer.on_context_compact(
+            folded_count,
+            self.last_prompt_tokens,
+            self.context_limit,
+            self.context_watermark,
+        )
+        if folded_count:
+            self._invalidate_context_usage()
+        return folded_count
 
     def _run_turn(self) -> str:
         """跑一轮 LLM 调用：实时渲染事件流，返回拼接好的完整 content。"""
@@ -57,6 +169,31 @@ class Agent:
                 self.renderer.on_content_delta(event.piece)
             elif isinstance(event, ContentDone):
                 content = event.content
+            elif isinstance(event, UsageEvent):
+                usage = event.usage
+                if isinstance(usage, dict):
+                    prompt_tokens = usage.get("prompt_tokens")
+                    completion_tokens = usage.get("completion_tokens", 0)
+                    total_tokens = usage.get("total_tokens")
+                else:
+                    prompt_tokens = getattr(usage, "prompt_tokens", None)
+                    completion_tokens = getattr(usage, "completion_tokens", 0)
+                    total_tokens = getattr(usage, "total_tokens", None)
+
+                if total_tokens is None and prompt_tokens is not None:
+                    total_tokens = prompt_tokens + (completion_tokens or 0)
+
+                self.last_prompt_tokens = prompt_tokens
+                self.last_completion_tokens = completion_tokens
+                self.last_total_tokens = total_tokens
+                self.total_completion_tokens += completion_tokens or 0
+                self.renderer.on_usage(
+                    self.last_prompt_tokens,
+                    self.last_completion_tokens,
+                    self.last_total_tokens,
+                    self.total_completion_tokens,
+                    self.context_limit,
+                )
         return content
 
     def _execute_tool_call(self, tool_call: ToolCall) -> ToolResult:
@@ -184,6 +321,8 @@ class Agent:
         self.messages.append({"role": "user", "content": prompt})
 
         for _ in range(max_steps):
+            self._compact_context_if_needed()
+
             # ----- 步骤 1：调用 LLM 推理 -----
             content = self._run_turn()
             self.messages.append({"role": "assistant", "content": content})

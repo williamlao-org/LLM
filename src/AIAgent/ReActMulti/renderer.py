@@ -44,6 +44,7 @@ class _Style:
     GREEN = "\033[32m"  # 绿：成功 / 最终答案
     RED = "\033[31m"  # 红：失败
     YELLOW = "\033[33m"  # 黄：工具调用
+    ORANGE = "\033[38;5;208m"  # 橙：用量 / 预算提示
     BOLD = "\033[1m"
     RESET = "\033[0m"
 
@@ -61,6 +62,25 @@ class Renderer(ABC):
     def on_tool_result(self, tool_result: "ToolResult | dict") -> None: ...
     @abstractmethod
     def on_final(self, answer: Any) -> None: ...
+
+    def on_usage(
+        self,
+        prompt_tokens: int | None,
+        completion_tokens: int | None,
+        total_tokens: int | None,
+        total_completion_tokens: int,
+        context_limit: int | None,
+    ) -> None:
+        """token 用量回调。默认不输出，子类按需覆盖。"""
+
+    def on_context_compact(
+        self,
+        folded_count: int,
+        prompt_tokens: int | None,
+        context_limit: int | None,
+        context_watermark: float,
+    ) -> None:
+        """上下文压缩回调。默认不输出，子类按需覆盖。"""
 
     def on_command_output(self, line: str) -> None:
         """命令流式输出回调。默认不输出，子类按需覆盖。"""
@@ -135,6 +155,68 @@ class ConsoleRenderer(Renderer):
         else:
             print(f"{_Style.RED}{_Style.BOLD}❌ 工具失败{_Style.RESET}")
             print(f"{_Style.RED}{tool_result.get('err')}{_Style.RESET}\n", flush=True)
+
+    def on_usage(
+        self,
+        prompt_tokens: int | None,
+        completion_tokens: int | None,
+        total_tokens: int | None,
+        total_completion_tokens: int,
+        context_limit: int | None,
+    ) -> None:
+        self._end_stream()
+        input_tokens = prompt_tokens if prompt_tokens is not None else "?"
+        output_tokens = completion_tokens if completion_tokens is not None else "?"
+        request_total = total_tokens if total_tokens is not None else "?"
+
+        if prompt_tokens is not None and context_limit:
+            context_usage = f"{prompt_tokens} / {context_limit}"
+            context_percent = f" ({prompt_tokens / context_limit:.1%})"
+        else:
+            context_usage = f"{input_tokens} / ?"
+            context_percent = ""
+
+        print(
+            f"\n{_Style.ORANGE}{_Style.BOLD}tokens{_Style.RESET} "
+            f"{_Style.ORANGE}本轮输入 {input_tokens} / "
+            f"本轮输出 {output_tokens} / "
+            f"本轮总计 {request_total} / "
+            f"累计输出 {total_completion_tokens}{_Style.RESET}"
+            f"\n{_Style.ORANGE}{_Style.BOLD}context{_Style.RESET} "
+            f"{_Style.ORANGE}上下文水位 {context_usage}{context_percent}"
+            f"{_Style.RESET}",
+            flush=True,
+        )
+
+    def on_context_compact(
+        self,
+        folded_count: int,
+        prompt_tokens: int | None,
+        context_limit: int | None,
+        context_watermark: float,
+    ) -> None:
+        self._end_stream()
+        if prompt_tokens is not None and context_limit:
+            context_usage = f"{prompt_tokens} / {context_limit}"
+            context_percent = f" ({prompt_tokens / context_limit:.1%})"
+        else:
+            context_usage = "? / ?"
+            context_percent = ""
+        watermark = f"{context_watermark:.0%}"
+
+        if folded_count > 0:
+            message = f"已折叠 {folded_count} 条旧工具结果"
+            style = _Style.ORANGE
+        else:
+            message = "上下文已超水位,但暂无可折叠旧工具结果"
+            style = _Style.YELLOW
+
+        print(
+            f"\n{style}{_Style.BOLD}context compact{_Style.RESET} "
+            f"{style}{message} / 水位 {context_usage}{context_percent} / "
+            f"阈值 {watermark}{_Style.RESET}",
+            flush=True,
+        )
 
     def on_final(self, answer) -> None:
         self._end_stream()
