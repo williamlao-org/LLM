@@ -7,6 +7,7 @@ ReActMulti Agent 主入口模块（多工具版）
 """
 
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -15,6 +16,7 @@ from .logger import get_logger
 from .tools import tools
 from .llm import LLMClient
 from .renderer import ConsoleRenderer
+from .session import SessionState
 
 
 logger = get_logger(__name__)
@@ -37,9 +39,14 @@ if __name__ == "__main__":
     )
     renderer = ConsoleRenderer()
 
-    agent = Agent(llm_client, tools, renderer,keep_recent_tool_results=1)
+    prompt = "执行命令查看当前主机信息，查看装了那些应用"
+    session_state = SessionState.create(
+        user_goal=prompt,
+        workspace_dir=Path(__file__).resolve().parent / "workspace",
+    )
+    agent = Agent(llm_client, tools, session_state, renderer, keep_recent_tool_results=1)
 
     agent.run(
         # "执行 python 代码 print(1/0)，并且用 web_search 搜索 2024 年奥运会在哪举办，再对 ifconfig.me/ip 发起 http 请求拿到公网 IP。执行命令查看当前主机信息"
-        "执行命令查看当前主机信息，查看装了那些应用"
+        prompt
     )

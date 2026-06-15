@@ -1,3 +1,4 @@
+from .session import SessionState, ToolExecutionStatus, UsageRecord
 from math import ceil
 from .util import (
     llm_json_parser,
@@ -24,6 +25,7 @@ class Agent:
         self,
         llm: LLMClient,
         tools: list[Tool],
+        session_state: SessionState,
         renderer: Renderer,
         tool_timeout: float = 30,
         context_watermark: float = 0.75,
@@ -31,20 +33,16 @@ class Agent:
     ):
         self.llm = llm
         self.tools = tools
+        self.session_state = session_state
         self.renderer = renderer
         self.tool_timeout = tool_timeout
 
         # 用量属性
-        self.last_prompt_tokens: int | None = None
-        self.last_completion_tokens: int | None = None
-        self.last_total_tokens: int | None = None
-        self.total_completion_tokens: int = 0
-        self.context_limit = llm.context_limit
         self.context_watermark = context_watermark
         self.keep_recent_tool_results = keep_recent_tool_results
 
-        self.messages: list[ChatCompletionMessageParam] = [
-            {
+        if not self.session_state.messages:
+            msg: ChatCompletionMessageParam = {
                 "role": "system",
                 "content": SYSTEM_PROMPT.format(
                     tools=json.dumps(
@@ -52,22 +50,32 @@ class Agent:
                     )
                 ),
             }
-        ]
+            self.session_state.messages.append(msg)
         self.tool_registry = {tool.name: tool.func for tool in tools}
+
+    @property
+    def context_limit(self) -> int | None:
+        return self.llm.context_limit
+
+    @property
+    def messages(self) -> list[ChatCompletionMessageParam]:
+        return self.session_state.messages
 
     def _context_over_watermark(self) -> bool:
         if self.context_limit is None:
             return False
 
-        if self.last_prompt_tokens is None:
+        if self.session_state.last_usage is None:
             return False
 
-        return self.last_prompt_tokens > self.context_limit * self.context_watermark
+        return (
+            self.session_state.last_usage.prompt_tokens
+            > self.context_limit * self.context_watermark
+        )
 
     def _invalidate_context_usage(self) -> None:
         """本地改写 messages 后,上一次 prompt/total token 读数已不再对应当前上下文。"""
-        self.last_prompt_tokens = None
-        self.last_total_tokens = None
+        self.session_state.last_usage = None
 
     def _is_tool_result_message(self, msg: ChatCompletionMessageParam) -> bool:
         if msg.get("role") != "user":
@@ -145,10 +153,14 @@ class Agent:
         if not self._context_over_watermark():
             return 0
 
+        usage = self.session_state.last_usage
+        if usage is None:
+            return 0
+
         folded_count = self._fold_old_tool_results()
         self.renderer.on_context_compact(
             folded_count,
-            self.last_prompt_tokens,
+            usage.prompt_tokens,
             self.context_limit,
             self.context_watermark,
         )
@@ -156,12 +168,14 @@ class Agent:
             self._invalidate_context_usage()
         return folded_count
 
-    def _run_turn(self) -> str:
+    def _run_turn(self) -> tuple[str, UsageRecord | None]:
         """跑一轮 LLM 调用：实时渲染事件流，返回拼接好的完整 content。"""
 
         # 初始化空串:依赖"LLMClient 必以 ContentDone 收尾"的契约,
         # 但契约被破坏时不该炸出莫名其妙的 NameError
         content = ""
+        usage_record: UsageRecord | None = None
+
         for event in self.llm(self.messages):
             if isinstance(event, ReasoningDelta):
                 self.renderer.on_reasoning_delta(event.piece)
@@ -172,29 +186,31 @@ class Agent:
             elif isinstance(event, UsageEvent):
                 usage = event.usage
                 if isinstance(usage, dict):
-                    prompt_tokens = usage.get("prompt_tokens")
-                    completion_tokens = usage.get("completion_tokens", 0)
+                    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+                    completion_tokens = int(usage.get("completion_tokens") or 0)
                     total_tokens = usage.get("total_tokens")
                 else:
-                    prompt_tokens = getattr(usage, "prompt_tokens", None)
-                    completion_tokens = getattr(usage, "completion_tokens", 0)
+                    prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+                    completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
                     total_tokens = getattr(usage, "total_tokens", None)
 
-                if total_tokens is None and prompt_tokens is not None:
-                    total_tokens = prompt_tokens + (completion_tokens or 0)
+                if total_tokens is None:
+                    total_tokens = prompt_tokens + completion_tokens
 
-                self.last_prompt_tokens = prompt_tokens
-                self.last_completion_tokens = completion_tokens
-                self.last_total_tokens = total_tokens
-                self.total_completion_tokens += completion_tokens or 0
+                usage_record = UsageRecord(
+                    prompt_tokens,
+                    completion_tokens,
+                    int(total_tokens or 0),
+                )
+
                 self.renderer.on_usage(
-                    self.last_prompt_tokens,
-                    self.last_completion_tokens,
-                    self.last_total_tokens,
-                    self.total_completion_tokens,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
                     self.context_limit,
                 )
-        return content
+
+        return content, usage_record
 
     def _execute_tool_call(self, tool_call: ToolCall) -> ToolResult:
         """查找并执行【单个】工具，返回标准化 tool_result。"""
@@ -261,8 +277,8 @@ class Agent:
         on_call: Callable[[ToolCall], None] | None = None,
         on_result: Callable[[ToolResult], None] | None = None,
         max_workers: int = 8,
-    ) -> list[tuple[ToolCall, ToolResult]]:
-        """并行执行工具,返回 (call, result) 列表,顺序与输入 tool_calls 一致。
+    ) -> list[tuple[ToolCall, ToolResult, ToolExecutionStatus]]:
+        """并行执行工具,返回 (call, result, status) 列表,顺序与输入 tool_calls 一致。
 
         为什么用线程池而非进程池:工具(读写文件/跑命令/查网络)都是 I/O 密集,
         等待时释放 GIL,线程足够;且进程池要求参数能 pickle,得不偿失。
@@ -283,7 +299,9 @@ class Agent:
                 on_call(tool_call)
 
         # 预留与输入等长的槽位,完工后按原始下标回填 → 保序
-        slots: list[tuple[ToolCall, ToolResult] | None] = [None] * len(tool_calls)
+        slots: list[tuple[ToolCall, ToolResult, ToolExecutionStatus] | None] = [
+            None
+        ] * len(tool_calls)
         budget = self.tool_timeout * ceil(len(tool_calls) / max_workers)
 
         pool = ThreadPoolExecutor(max_workers=max_workers)
@@ -299,7 +317,11 @@ class Agent:
                 result = fut.result()  # _execute_tool_call 不抛异常,恒拿到 ToolResult
                 if on_result:
                     on_result(result)
-                slots[idx] = (tool_calls[idx], result)
+                slots[idx] = (
+                    tool_calls[idx],
+                    result,
+                    "succeeded" if result.ok else "failed",
+                )
 
         except (TimeoutError, FuturesTimeoutError):
             for idx, slot in enumerate(slots):
@@ -309,41 +331,85 @@ class Agent:
                     )
                     if on_result:
                         on_result(result)
-                    slots[idx] = (tool_calls[idx], result)
+                    slots[idx] = (tool_calls[idx], result, "timeout")
 
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
 
         return [slot for slot in slots if slot is not None]
 
-    def run(self, prompt: str, max_steps: int = 25) -> str | None:
+    def run(self, prompt: str, max_steps: int | None = None) -> str | None:
         """执行任务直到模型给出 final_answer(返回它)或步数耗尽(返回 None)。"""
+        max_steps = self.session_state.max_steps if max_steps is None else max_steps
+        self.session_state.max_steps = max_steps
         self.messages.append({"role": "user", "content": prompt})
 
         for _ in range(max_steps):
             self._compact_context_if_needed()
 
             # ----- 步骤 1：调用 LLM 推理 -----
-            content = self._run_turn()
+            content, usage_record = self._run_turn()
+
             self.messages.append({"role": "assistant", "content": content})
 
             # ----- 步骤 2：解析 + 路由 -----
             try:
                 content_json = llm_json_parser(content)
+
                 kind, payload = route(content_json)
 
                 if kind == "final":
                     self.renderer.on_final(payload)
+                    # 更新会话，添加成功回合记录
+                    turn_record = self.session_state.record_assistant_turn(
+                        assistant_raw=content,
+                        parsed=content_json,
+                        route="final",
+                    )
+                    if usage_record is not None:
+                        self.session_state.record_usage_for_turn(
+                            turn_record, usage_record
+                        )
+
+                    self.session_state.mark_completed()
                     return payload
 
-                tool_calls = parse_tool_calls(payload)
+                if kind == "tool_calls":
+                    tool_calls = parse_tool_calls(payload)
 
-                results = self.execute_tool_calls_parallel(
-                    tool_calls,
-                    on_call=self.renderer.on_tool_call,
-                    on_result=self.renderer.on_tool_result,
-                )
-                self.messages.append(build_tool_results_message(results))
+                    # 更新会话，添加成功回合记录
+                    turn_record = self.session_state.record_assistant_turn(
+                        assistant_raw=content,
+                        parsed=content_json,
+                        route="tool_calls",
+                        tool_calls=tool_calls,
+                    )
+                    if usage_record is not None:
+                        self.session_state.record_usage_for_turn(
+                            turn_record, usage_record
+                        )
+
+                    results = self.execute_tool_calls_parallel(
+                        tool_calls,
+                        on_call=self.renderer.on_tool_call,
+                        on_result=self.renderer.on_tool_result,
+                    )
+
+                    for tool_call, result, status in results:
+                        self.session_state.record_tool_execution(
+                            call_id=tool_call.id,
+                            result=result,
+                            status=status,
+                        )
+
+                    self.messages.append(
+                        build_tool_results_message(
+                            [
+                                (tool_call, result)
+                                for tool_call, result, _status in results
+                            ]
+                        )
+                    )
 
             except TurnAbort as e:
                 msg: ChatCompletionMessageParam = {
@@ -353,6 +419,15 @@ class Agent:
                         ensure_ascii=False,
                     ),
                 }
+
+                # 更新会话，添加失败回合记录
+                turn_record = self.session_state.record_invalid_turn(
+                    content,
+                    f"LLM 输出无法解析或路由: {e}",
+                )
+                if usage_record is not None:
+                    self.session_state.record_usage_for_turn(turn_record, usage_record)
+
                 self.messages.append(msg)
                 continue
 
@@ -360,4 +435,5 @@ class Agent:
             self.renderer.on_final(
                 f"已达到最大步数上限（{max_steps} 步），任务未完成。"
             )
+            self.session_state.mark_max_steps()
             return None

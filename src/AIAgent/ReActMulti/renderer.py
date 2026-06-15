@@ -68,7 +68,6 @@ class Renderer(ABC):
         prompt_tokens: int | None,
         completion_tokens: int | None,
         total_tokens: int | None,
-        total_completion_tokens: int,
         context_limit: int | None,
     ) -> None:
         """token 用量回调。默认不输出，子类按需覆盖。"""
@@ -161,7 +160,6 @@ class ConsoleRenderer(Renderer):
         prompt_tokens: int | None,
         completion_tokens: int | None,
         total_tokens: int | None,
-        total_completion_tokens: int,
         context_limit: int | None,
     ) -> None:
         self._end_stream()
@@ -181,7 +179,6 @@ class ConsoleRenderer(Renderer):
             f"{_Style.ORANGE}本轮输入 {input_tokens} / "
             f"本轮输出 {output_tokens} / "
             f"本轮总计 {request_total} / "
-            f"累计输出 {total_completion_tokens}{_Style.RESET}"
             f"\n{_Style.ORANGE}{_Style.BOLD}context{_Style.RESET} "
             f"{_Style.ORANGE}上下文水位 {context_usage}{context_percent}"
             f"{_Style.RESET}",

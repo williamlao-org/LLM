@@ -9,12 +9,14 @@ LLMClient 用假参数构造(不发起任何网络请求),整套测试离线可�
 
 import json
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 from .agent import Agent
 from .events import ContentDelta, ContentDone, UsageEvent
 from .llm import LLMClient
 from .renderer import SilentRenderer
+from .session import SessionState, UsageRecord
 from .tools.base import Tool, ToolCall, ToolResult
 
 
@@ -39,6 +41,13 @@ class RecordingRenderer(SilentRenderer):
         )
 
 
+def _make_session(user_goal: str = "") -> SessionState:
+    return SessionState.create(
+        user_goal=user_goal,
+        workspace_dir=Path(__file__).resolve().parent / "workspace",
+    )
+
+
 def _make_agent(
     tools: list[Tool], tool_timeout: float, keep_recent_tool_results: int = 3
 ) -> Agent:
@@ -48,10 +57,25 @@ def _make_agent(
     return Agent(
         llm,
         tools,
+        _make_session(),
         SilentRenderer(),
         tool_timeout=tool_timeout,
         keep_recent_tool_results=keep_recent_tool_results,
     )
+
+
+def test_agent_does_not_duplicate_system_prompt_for_existing_session():
+    llm = LLMClient(
+        base_url="http://x", api_key="sk-x", model="m", context_limit=128_000
+    )
+    session = _make_session()
+
+    first_agent = Agent(llm, [], session, SilentRenderer(), tool_timeout=5)
+    second_agent = Agent(llm, [], session, SilentRenderer(), tool_timeout=5)
+
+    system_messages = [msg for msg in session.messages if msg.get("role") == "system"]
+    assert first_agent.messages is second_agent.messages
+    assert len(system_messages) == 1
 
 
 def test_parallel_timeout_fills_fail():
@@ -76,7 +100,9 @@ def test_parallel_timeout_fills_fail():
 
     assert len(results) == len(calls), "模型靠 id 对账,结果少一条都不行"
     assert results[0][1].ok and results[0][1].data == "fast done"
+    assert results[0][2] == "succeeded"
     assert not results[1][1].ok and "timeout" in results[1][1].err
+    assert results[1][2] == "timeout"
     assert elapsed < 2, f"应在预算 0.5s 附近返回,实际等了 {elapsed:.1f}s"
 
 
@@ -126,19 +152,15 @@ def test_run_turn_records_usage():
                 )
             )
 
-    agent = Agent(FakeLLM(), [], SilentRenderer(), tool_timeout=5)
+    agent = Agent(FakeLLM(), [], _make_session(), SilentRenderer(), tool_timeout=5)
 
-    assert agent._run_turn() == "content 1"
-    assert agent.last_prompt_tokens == 100
-    assert agent.last_completion_tokens == 10
-    assert agent.last_total_tokens == 110
-    assert agent.total_completion_tokens == 10
+    content, usage = agent._run_turn()
+    assert content == "content 1"
+    assert usage == UsageRecord(prompt_tokens=100, completion_tokens=10, total_tokens=110)
 
-    assert agent._run_turn() == "content 2"
-    assert agent.last_prompt_tokens == 200
-    assert agent.last_completion_tokens == 20
-    assert agent.last_total_tokens == 220
-    assert agent.total_completion_tokens == 30
+    content, usage = agent._run_turn()
+    assert content == "content 2"
+    assert usage == UsageRecord(prompt_tokens=200, completion_tokens=20, total_tokens=220)
 
 
 def test_run_turn_records_dict_usage():
@@ -165,13 +187,13 @@ def test_run_turn_records_dict_usage():
                 }
             )
 
-    agent = Agent(FakeLLM(), [], SilentRenderer(), tool_timeout=5)
+    agent = Agent(FakeLLM(), [], _make_session(), SilentRenderer(), tool_timeout=5)
 
-    assert agent._run_turn() == "ok"
-    assert agent.last_prompt_tokens == 11
-    assert agent.last_completion_tokens == 1541
-    assert agent.last_total_tokens == 1552
-    assert agent.total_completion_tokens == 1541
+    content, usage = agent._run_turn()
+    assert content == "ok"
+    assert usage == UsageRecord(
+        prompt_tokens=11, completion_tokens=1541, total_tokens=1552
+    )
 
 
 def test_stream_usage_event_can_live_on_choice_chunk():
@@ -201,6 +223,105 @@ def test_stream_usage_event_can_live_on_choice_chunk():
     assert isinstance(events[0], ContentDelta) and events[0].piece == "hi"
     assert isinstance(events[1], UsageEvent)
     assert isinstance(events[-1], ContentDone)
+
+
+def test_session_records_tool_turn_and_execution():
+    session = _make_session("inspect file")
+    call = ToolCall("read_file", {"file": "a.py"}, "call_1")
+
+    turn = session.record_assistant_turn(
+        assistant_raw='{"tool_calls":[{"name":"read_file"}],"final_answer":null}',
+        parsed={"tool_calls": [{"name": "read_file"}], "final_answer": None},
+        route="tool_calls",
+        tool_calls=[call],
+    )
+
+    assert session.step_count == 1
+    assert turn.step == 1
+    assert turn.tool_execution_ids == ["call_1"]
+    assert session.tool_executions["call_1"].call is call
+    assert session.tool_executions["call_1"].result is None
+    assert session.tool_executions["call_1"].status == "pending"
+
+    result = ToolResult.success({"content": "hello"})
+    execution = session.record_tool_execution("call_1", result)
+
+    assert execution.result is result
+    assert execution.status == "succeeded"
+
+
+def test_session_rejects_duplicate_tool_ids_without_partial_state():
+    session = _make_session("duplicate calls")
+    calls = [
+        ToolCall("read_file", {"file": "a.py"}, "call_dup"),
+        ToolCall("read_file", {"file": "b.py"}, "call_dup"),
+    ]
+
+    try:
+        session.record_assistant_turn(
+            assistant_raw='{"tool_calls":[{},{}],"final_answer":null}',
+            parsed={"tool_calls": [{}, {}], "final_answer": None},
+            route="tool_calls",
+            tool_calls=calls,
+        )
+    except ValueError as exc:
+        assert "重复的 tool_call id" in str(exc)
+    else:
+        raise AssertionError("duplicate tool_call ids should be rejected")
+
+    assert session.step_count == 0
+    assert session.turns == []
+    assert session.tool_executions == {}
+
+
+def test_session_records_invalid_usage_and_status():
+    session = _make_session("bad output")
+
+    turn = session.record_invalid_turn("not json", "LLM 输出不是合法 JSON")
+    assert session.step_count == 1
+    assert turn.route == "invalid"
+    assert turn.error == "LLM 输出不是合法 JSON"
+    assert turn.tool_execution_ids == []
+
+    session.record_usage_for_turn(
+        turn,
+        UsageRecord(prompt_tokens=10, completion_tokens=2, total_tokens=12),
+    )
+    assert turn.usage == UsageRecord(prompt_tokens=10, completion_tokens=2, total_tokens=12)
+    assert session.last_usage == turn.usage
+    assert session.total_usage == UsageRecord(
+        prompt_tokens=10, completion_tokens=2, total_tokens=12
+    )
+
+    final_turn = session.record_assistant_turn(
+        assistant_raw='{"tool_calls":[],"final_answer":"done"}',
+        parsed={"tool_calls": [], "final_answer": "done"},
+        route="final",
+    )
+    assert final_turn.step == 2
+    assert final_turn.tool_execution_ids == []
+
+    session.mark_completed()
+    assert session.status == "completed"
+    session.mark_max_steps()
+    assert session.status == "max_steps"
+
+
+def test_run_defaults_to_session_max_steps():
+    class InvalidLLM:
+        context_limit = 128_000
+
+        def __call__(self, messages):
+            yield ContentDone(content="not json")
+
+    session = _make_session()
+    session.max_steps = 2
+    agent = Agent(InvalidLLM(), [], session, SilentRenderer(), tool_timeout=5)
+
+    assert agent.run("keep failing") is None
+    assert session.status == "max_steps"
+    assert session.step_count == 2
+    assert session.max_steps == 2
 
 
 def test_is_tool_result_message_only_accepts_valid_tool_results():
@@ -349,24 +470,21 @@ def test_compact_context_if_needed_folds_and_reports():
     agent = Agent(
         llm,
         [],
+        _make_session(),
         renderer,
         tool_timeout=5,
         context_watermark=0.75,
         keep_recent_tool_results=2,
     )
-    agent.last_prompt_tokens = 80
-    agent.last_total_tokens = 90
-    agent.last_completion_tokens = 10
-    agent.total_completion_tokens = 123
+    agent.session_state.last_usage = UsageRecord(
+        prompt_tokens=80, completion_tokens=10, total_tokens=90
+    )
 
     for i in range(5):
         _append_tool_result_message(agent, i)
 
     assert agent._compact_context_if_needed() == 3
-    assert agent.last_prompt_tokens is None
-    assert agent.last_total_tokens is None
-    assert agent.last_completion_tokens == 10
-    assert agent.total_completion_tokens == 123
+    assert agent.session_state.last_usage is None
     assert renderer.context_compacts == [
         {
             "folded_count": 3,
@@ -385,17 +503,20 @@ def test_compact_context_if_needed_reports_when_nothing_to_fold():
     agent = Agent(
         llm,
         [],
+        _make_session(),
         renderer,
         tool_timeout=5,
         context_watermark=0.75,
         keep_recent_tool_results=3,
     )
-    agent.last_prompt_tokens = 80
-    agent.last_total_tokens = 90
+    agent.session_state.last_usage = UsageRecord(
+        prompt_tokens=80, completion_tokens=10, total_tokens=90
+    )
 
     assert agent._compact_context_if_needed() == 0
-    assert agent.last_prompt_tokens == 80
-    assert agent.last_total_tokens == 90
+    assert agent.session_state.last_usage == UsageRecord(
+        prompt_tokens=80, completion_tokens=10, total_tokens=90
+    )
     assert renderer.context_compacts == [
         {
             "folded_count": 0,
@@ -414,24 +535,30 @@ def test_compact_context_if_needed_skips_below_watermark():
     agent = Agent(
         llm,
         [],
+        _make_session(),
         renderer,
         tool_timeout=5,
         context_watermark=0.75,
         keep_recent_tool_results=1,
     )
-    agent.last_prompt_tokens = 75
+    agent.session_state.last_usage = UsageRecord(prompt_tokens=75, completion_tokens=0, total_tokens=75)
 
     assert agent._compact_context_if_needed() == 0
     assert renderer.context_compacts == []
 
 
 if __name__ == "__main__":
+    test_agent_does_not_duplicate_system_prompt_for_existing_session()
     test_parallel_timeout_fills_fail()
     test_inner_timeout_clamped_to_budget()
     test_tool_exception_becomes_fail()
     test_run_turn_records_usage()
     test_run_turn_records_dict_usage()
     test_stream_usage_event_can_live_on_choice_chunk()
+    test_session_records_tool_turn_and_execution()
+    test_session_rejects_duplicate_tool_ids_without_partial_state()
+    test_session_records_invalid_usage_and_status()
+    test_run_defaults_to_session_max_steps()
     test_is_tool_result_message_only_accepts_valid_tool_results()
     test_fold_old_tool_results_keeps_recent_and_roles()
     test_fold_old_tool_results_is_idempotent()
