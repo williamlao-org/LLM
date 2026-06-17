@@ -1,6 +1,50 @@
-from uuid import uuid4
 from dataclasses import dataclass
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any, Callable, Literal
+
+from ..permission_types import PermissionCheckResult
+
+# 并发策略:parallel = 只读/无本地副作用,可丢线程池并发;
+# serial = 会改 workspace 或有副作用,必须串行执行。
+# 默认 serial:新工具不显式声明时按最保守处理,宁可慢不要竞态。
+Concurrency = Literal["parallel", "serial"]
+
+
+@dataclass
+class ToolRuntime:
+    """执行器传给工具的运行期上下文,不属于模型可见参数。
+
+    只放"程序运行时能力":渲染/进度回调、调用标识、workspace/cwd、取消信号等。
+    不放模型生成的业务参数(command/file/timeout...),那些只走 ToolCall.arguments。
+    """
+
+    # 当前工具调用标识:用于日志、进度事件、后台任务关联。
+    tool_name: str = ""
+    tool_call_id: str = ""
+
+    # 当前会话的本地执行边界。工具需要定位 workspace/cwd 时优先用这里,
+    # 避免各工具自己猜 Path.cwd() 或维护重复状态。
+    workspace_dir: Path | None = None
+    cwd_provider: Callable[[], Path] | None = None
+
+    # 文本流式输出:例如 shell stdout。命名保持通用,不绑定 command 工具。
+    emit_output: Callable[[str], None] | None = None
+
+    # 结构化进度事件:未来可用于下载进度、批处理进度、后台任务状态等。
+    emit_progress: Callable[[dict[str, Any]], None] | None = None
+
+    # 取消信号:未来用户中断/上层 abort 时,长任务工具可主动停止。
+    is_cancelled: Callable[[], bool] | None = None
+
+
+def _default_check_permission(
+    args: dict[str, Any], runtime: ToolRuntime
+) -> PermissionCheckResult:
+    return PermissionCheckResult(
+        "allow",
+        f"{runtime.tool_name or 'tool'}: allowed by default tool permission",
+        source="tool_default",
+    )
 
 
 @dataclass
@@ -8,9 +52,14 @@ class Tool:
     name: str
     description: str
     parameters: dict
-    func: Callable[..., "ToolResult"]
+    call: Callable[[dict[str, Any], ToolRuntime], "ToolResult"]
+    check_permission: Callable[[dict[str, Any], ToolRuntime], PermissionCheckResult] = (
+        _default_check_permission
+    )
+    concurrency: Concurrency = "serial"
 
     def to_dict(self):
+        # concurrency 是系统调度用的内部元数据,不喂给模型(模型只管想调什么)。
         return {
             "name": self.name,
             "description": self.description,
@@ -23,29 +72,6 @@ class ToolCall:
     name: str
     arguments: dict
     id: str = ""
-    # 解析阶段失败时,造一个带 error 的占位 ToolCall;正常调用此字段恒为空。
-    # 执行阶段据此识别"这条 call 在解析时就废了",直接吐 fail,不查表。
-    error: str = ""
-
-    @classmethod
-    def from_dict(cls, tool_call_dict, call_id: str | None) -> "ToolCall":
-        if not isinstance(tool_call_dict, dict):
-            raise ValueError(f"tool_call 不是对象: {tool_call_dict!r}")
-
-        name = tool_call_dict.get("name")
-        if not isinstance(name, str) or not name:
-            raise ValueError(f"tool_call 缺少合法 name: {tool_call_dict!r}")
-
-        args = tool_call_dict.get(
-            "arguments", {}
-        )  # 缺省给空 dict,不让它 KeyError, args允许 llm 返回空字典
-        if not isinstance(args, dict):
-            raise ValueError(f"arguments 必须是对象: {args!r}")
-
-        if call_id is None:
-            call_id = f"call_{uuid4().hex[:6]}"
-
-        return cls(name=name, arguments=args, id=call_id)
 
 
 @dataclass

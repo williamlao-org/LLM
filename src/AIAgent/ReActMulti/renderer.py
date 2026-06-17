@@ -70,7 +70,7 @@ class Renderer(ABC):
         total_tokens: int | None,
         context_limit: int | None,
     ) -> None:
-        """token 用量回调。默认不输出，子类按需覆盖。"""
+        """本轮 token 用量回调(服务端精确值)。默认不输出，子类按需覆盖。"""
 
     def on_context_compact(
         self,
@@ -167,9 +167,12 @@ class ConsoleRenderer(Renderer):
         output_tokens = completion_tokens if completion_tokens is not None else "?"
         request_total = total_tokens if total_tokens is not None else "?"
 
-        if prompt_tokens is not None and context_limit:
-            context_usage = f"{prompt_tokens} / {context_limit}"
-            context_percent = f" ({prompt_tokens / context_limit:.1%})"
+        # 上下文水位 = P+C:模型回复(C)已入队 messages,下次一定是输入的一部分,
+        # 所以当前上下文的精确大小 = 本轮输入(P) + 本轮输出(C),两者都是服务端真值。
+        if prompt_tokens is not None and completion_tokens is not None and context_limit:
+            context_size = prompt_tokens + completion_tokens
+            context_usage = f"{context_size} / {context_limit}"
+            context_percent = f" ({context_size / context_limit:.1%})"
         else:
             context_usage = f"{input_tokens} / ?"
             context_percent = ""

@@ -1,44 +1,62 @@
-# ============================================================================
-# 【你要写的第 1 处 / 共 3 处】多工具版的 system prompt
-# ----------------------------------------------------------------------------
-# 参照隔壁 ReAct/prompt.py 的单工具版，把它改成"一个回合可以发起多个工具调用"。
-#
-# 思考题（写之前先想清楚，再动手）：
-#   1. 字段名：单工具是 "tool_call"（单个对象）。多工具该叫什么？是对象还是数组？
-#   2. 互斥规则：原版规定 tool_call 和 final_answer 恰好一个非 null。
-#      多工具版这条怎么改？（提示：数组为空 vs final_answer 非 null）
-#   3. 结果对账：一个回合发了 3 个调用，系统会回传 3 个结果。
-#      LLM 怎么知道"哪个结果对应哪个调用"？要不要给每个调用一个 id？
-#      —— 这一题会直接影响你第 3 处（main.py 的结果回传）怎么写。
-#
-# 写完后把下面这个占位字符串替换成你的真正 prompt。
-# 注意：用 .format(tools=...) 注入工具列表，所以模板里的花括号要写成 {{ }}（除了 {tools}）。
-# ============================================================================
+"""system prompt 组装。
+
+回合格式不再手写——由协议层的唯一来源 AgentTurn 生成 JSON Schema 注入,
+prompt 与回包校验同源,改 AgentTurn 两端一起变,不会漂。
+
+仍保留散文 Rules:二选一、工具名必须匹配这些是【语义约束】,JSON Schema
+表达不了(model_validator 在代码里兜),所以得在 prompt 里讲清楚。
+"""
+
+import json
+from typing import Any
+
+from .protocol import AgentTurn
+
+
+def _curate(node: Any) -> Any:
+    """剔掉自动生成的 schema 里不该给模型看的噪音。
+
+    pydantic 会把【类的 docstring】塞进对象级 description——那是给开发者看的
+    内部设计注释,泄漏给模型只会干扰。规则:凡是带 properties 的对象节点
+    (即某个 BaseModel 生成的 schema),删掉它的 description;title 一律删(纯噪音)。
+    字段级描述(写在属性里、自身不带 properties 的 Field(description=...))保留。
+    这一步就是"主动筛选模型该看到什么"。
+    """
+    if isinstance(node, dict):
+        node = {k: _curate(v) for k, v in node.items() if k != "title"}
+        if "properties" in node:
+            node.pop("description", None)
+        return node
+    if isinstance(node, list):
+        return [_curate(v) for v in node]
+    return node
+
+
+# 模块加载时生成一次(静态)。schema 里带 {} ,所以不能直接拼进 .format 模板,
+# 而是作为 format 的实参传入(实参里的花括号是字面量,不会被 format 再解释)。
+TURN_SCHEMA = json.dumps(
+    _curate(AgentTurn.model_json_schema()), ensure_ascii=False, indent=2
+)
 
 SYSTEM_PROMPT = """
-You are a assistant with follow available tools:
+You are an assistant with the following available tools:
 
 Available tools:
 {tools}
 
-You must think and act using the following structure and output exactly one JSON object each turn:
+Each turn you MUST output exactly one JSON object that conforms to this schema:
 
-{{
-  "reasoning": "<your thought, analysis, and reasoning for this step>",
-  "tool_calls": [
-    {{
-        "name": "<tool_name>",
-        "arguments": {{ ... }}
-    }}
-  ],
-  "final_answer": "<If you have obtained the final answer, put it here; otherwise null>"
-}}
+{turn_schema}
 
-Rules (explicit):
-- Output must be strict JSON (parsable by `json.loads()`), with no surrounding commentary or extraneous characters.
-- `tool_calls` is a list. An empty list `[]` means you are NOT calling any tool this turn.
+Rules (semantic constraints the schema above cannot express):
+- Output strict JSON parsable by `json.loads()`, with no surrounding commentary.
 - Exactly one of the following holds each turn:
-    (a) `tool_calls` is non-empty AND `final_answer` is null  -> system executes the calls and returns results.
-    (b) `tool_calls` is `[]` AND `final_answer` is non-null    -> session ends.
-- When `tool_calls` is not `[]`, each value of those `name` must exactly match one of the tool names listed in the `Available tools` section above.
+    (a) `tool_calls` is non-empty AND `final_answer` is null -> system runs the calls and returns results.
+    (b) `tool_calls` is `[]` AND `final_answer` is non-null  -> session ends.
+- Each `tool_calls[].name` must exactly match one of the tool names in "Available tools".
 """
+
+
+def build_system_prompt(tools_json: str) -> str:
+    """把工具清单 + 回合 schema 注入模板,生成完整 system prompt。"""
+    return SYSTEM_PROMPT.format(tools=tools_json, turn_schema=TURN_SCHEMA)

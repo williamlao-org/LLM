@@ -17,7 +17,7 @@ from .events import ContentDelta, ContentDone, UsageEvent
 from .llm import LLMClient
 from .renderer import SilentRenderer
 from .session import SessionState, UsageRecord
-from .tools.base import Tool, ToolCall, ToolResult
+from .tools.base import Tool, ToolCall, ToolResult, ToolRuntime
 
 
 class RecordingRenderer(SilentRenderer):
@@ -74,7 +74,8 @@ def test_agent_does_not_duplicate_system_prompt_for_existing_session():
     second_agent = Agent(llm, [], session, SilentRenderer(), tool_timeout=5)
 
     system_messages = [msg for msg in session.messages if msg.get("role") == "system"]
-    assert first_agent.messages is second_agent.messages
+    assert tuple(first_agent.messages) == tuple(second_agent.messages)
+    assert not hasattr(first_agent.messages, "append")
     assert len(system_messages) == 1
 
 
@@ -89,20 +90,23 @@ def test_parallel_timeout_fills_fail():
         return ToolResult.success("slow done")
 
     agent = _make_agent(
-        [Tool("fast", "", {}, fast), Tool("slow", "", {}, slow)],
+        [
+            Tool("fast", "", {}, lambda args, runtime: fast(), concurrency="parallel"),
+            Tool("slow", "", {}, lambda args, runtime: slow(), concurrency="parallel"),
+        ],
         tool_timeout=0.5,
     )
     calls = [ToolCall("fast", {}, "c1"), ToolCall("slow", {}, "c2")]
 
     t0 = time.time()
-    results = agent.execute_tool_calls_parallel(calls)
+    outcomes = agent.executor.execute(calls)
     elapsed = time.time() - t0
 
-    assert len(results) == len(calls), "模型靠 id 对账,结果少一条都不行"
-    assert results[0][1].ok and results[0][1].data == "fast done"
-    assert results[0][2] == "succeeded"
-    assert not results[1][1].ok and "timeout" in results[1][1].err
-    assert results[1][2] == "timeout"
+    assert len(outcomes) == len(calls), "模型靠 id 对账,结果少一条都不行"
+    assert outcomes[0].result.ok and outcomes[0].result.data == "fast done"
+    assert outcomes[0].status == "succeeded"
+    assert not outcomes[1].result.ok and "timeout" in outcomes[1].result.err
+    assert outcomes[1].status == "timeout"
     assert elapsed < 2, f"应在预算 0.5s 附近返回,实际等了 {elapsed:.1f}s"
 
 
@@ -114,10 +118,39 @@ def test_inner_timeout_clamped_to_budget():
         captured["timeout"] = timeout
         return ToolResult.success(None)
 
-    agent = _make_agent([Tool("spy", "", {}, spy)], tool_timeout=30)
-    agent.execute_tool_calls([ToolCall("spy", {"timeout": 300}, "c1")])
+    agent = _make_agent(
+        [Tool("spy", "", {}, lambda args, runtime: spy(**args))],
+        tool_timeout=30,
+    )
+    agent.executor.execute([ToolCall("spy", {"timeout": 300}, "c1")])
 
     assert captured["timeout"] == 30
+
+
+def test_tool_runtime_is_separate_from_model_arguments():
+    """运行期上下文是 call 的独立参数,不混进模型生成的 arguments。"""
+
+    captured = {}
+
+    def spy(args: dict, runtime: ToolRuntime):
+        captured["args"] = args
+        captured["runtime"] = runtime
+        return ToolResult.success(None)
+
+    tool = Tool("spy", "", {}, spy)
+    tool_call = ToolCall("spy", {"runtime": "model supplied"}, "c1")
+    agent = _make_agent([tool], tool_timeout=5)
+
+    result = agent.executor.execute([tool_call])[0].result
+
+    assert result.ok
+    assert captured["args"] == {"runtime": "model supplied"}
+    assert isinstance(captured["runtime"], ToolRuntime)
+    assert captured["runtime"].tool_name == "spy"
+    assert captured["runtime"].tool_call_id == "c1"
+    assert captured["runtime"].workspace_dir == agent.session_state.workspace_dir
+    assert tool_call.arguments == {"runtime": "model supplied"}
+    assert "runtime" not in tool.to_dict()["parameters"].get("properties", {})
 
 
 def test_tool_exception_becomes_fail():
@@ -126,11 +159,14 @@ def test_tool_exception_becomes_fail():
     def boom():
         raise RuntimeError("炸了")
 
-    agent = _make_agent([Tool("boom", "", {}, boom)], tool_timeout=5)
-    results = agent.execute_tool_calls([ToolCall("boom", {}, "c1")])
+    agent = _make_agent(
+        [Tool("boom", "", {}, lambda args, runtime: boom())],
+        tool_timeout=5,
+    )
+    outcomes = agent.executor.execute([ToolCall("boom", {}, "c1")])
 
-    assert not results[0][1].ok
-    assert "RuntimeError" in results[0][1].err
+    assert not outcomes[0].result.ok
+    assert "RuntimeError" in outcomes[0].result.err
 
 
 def test_run_turn_records_usage():
@@ -217,6 +253,7 @@ def test_stream_usage_event_can_live_on_choice_chunk():
     llm.max_attempts = 1
     llm.base_wait = 0
     llm.max_wait = 0
+    llm.response_format = {"type": "json_object"}
 
     events = list(llm._call_stream([{"role": "user", "content": "hello"}]))
 
@@ -238,6 +275,7 @@ def test_session_records_tool_turn_and_execution():
 
     assert session.step_count == 1
     assert turn.step == 1
+    assert turn.message_id == "msg_1"
     assert turn.tool_execution_ids == ["call_1"]
     assert session.tool_executions["call_1"].call is call
     assert session.tool_executions["call_1"].result is None
@@ -307,6 +345,43 @@ def test_session_records_invalid_usage_and_status():
     assert session.status == "max_steps"
 
 
+def test_assistant_raw_uses_stable_message_id_after_non_assistant_reorder():
+    session = _make_session("stable ids")
+    session.append_message({"role": "user", "content": "before"})
+
+    first_turn = session.record_assistant_turn(
+        assistant_raw='{"tool_calls":[],"final_answer":"one"}',
+        parsed={"tool_calls": [], "final_answer": "one"},
+        route="final",
+    )
+    session.append_message({"role": "user", "content": "between"})
+    second_turn = session.record_assistant_turn(
+        assistant_raw='{"tool_calls":[],"final_answer":"two"}',
+        parsed={"tool_calls": [], "final_answer": "two"},
+        route="final",
+    )
+    session.append_message({"role": "user", "content": "after"})
+
+    assistant_records = [
+        record
+        for record in session.message_records
+        if record.message.get("role") == "assistant"
+    ]
+    user_records = [
+        record
+        for record in session.message_records
+        if record.message.get("role") == "user"
+    ]
+    session.message_records[:] = [
+        user_records[-1],
+        assistant_records[1],
+        assistant_records[0],
+    ]
+
+    assert session.assistant_raw(first_turn) == '{"tool_calls":[],"final_answer":"one"}'
+    assert session.assistant_raw(second_turn) == '{"tool_calls":[],"final_answer":"two"}'
+
+
 def test_run_defaults_to_session_max_steps():
     class InvalidLLM:
         context_limit = 128_000
@@ -324,23 +399,87 @@ def test_run_defaults_to_session_max_steps():
     assert session.max_steps == 2
 
 
-def test_is_tool_result_message_only_accepts_valid_tool_results():
-    agent = _make_agent([], tool_timeout=5)
+def test_run_aborts_after_consecutive_invalid():
+    """连续 N 轮废 JSON 就止损 failed,不该把 max_steps 烧光。"""
 
-    assert agent._is_tool_result_message(
+    class InvalidLLM:
+        context_limit = 128_000
+
+        def __call__(self, messages):
+            yield ContentDone(content="not json")
+
+    session = _make_session()
+    session.max_steps = 25
+    agent = Agent(
+        InvalidLLM(),
+        [],
+        session,
+        SilentRenderer(),
+        tool_timeout=5,
+        max_consecutive_invalid=3,
+    )
+
+    assert agent.run("keep failing") is None
+    assert session.status == "failed"
+    assert session.step_count == 3, "第 3 次连续失败就该止损,不烧到 max_steps"
+
+
+def test_consecutive_invalid_resets_on_success():
+    """计数器是'连续'语义:中间成功一次必须清零,不是累计总失败数。"""
+
+    script = [
+        "not json",  # 连续 1
+        json.dumps({"tool_calls": [{"name": "noop"}], "final_answer": None}),  # 成功→清零
+        "not json",  # 连续 1(若没清零会变成 2 而误杀)
+        json.dumps({"tool_calls": [], "final_answer": "done"}),  # 成功收尾
+    ]
+
+    class ScriptedLLM:
+        context_limit = 128_000
+
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, messages):
+            content = script[self.calls]
+            self.calls += 1
+            yield ContentDone(content=content)
+
+    def noop():
+        return ToolResult.success("ok")
+
+    session = _make_session()
+    agent = Agent(
+        ScriptedLLM(),
+        [Tool("noop", "", {}, lambda args, runtime: noop())],
+        session,
+        SilentRenderer(),
+        tool_timeout=5,
+        max_consecutive_invalid=2,
+    )
+
+    # 阈值 2,但失败从不连续出现两次,所以应正常完成而非 failed
+    assert agent.run("mix") == "done"
+    assert session.status == "completed"
+
+
+def test_is_tool_result_message_only_accepts_valid_tool_results():
+    compactor = _make_agent([], tool_timeout=5).compactor
+
+    assert compactor._is_tool_result_message(
         {"role": "user", "content": json.dumps({"tool_results": []})}
     )
-    assert not agent._is_tool_result_message(
+    assert not compactor._is_tool_result_message(
         {"role": "assistant", "content": json.dumps({"tool_results": []})}
     )
-    assert not agent._is_tool_result_message({"role": "user", "content": "not json"})
-    assert not agent._is_tool_result_message(
+    assert not compactor._is_tool_result_message({"role": "user", "content": "not json"})
+    assert not compactor._is_tool_result_message(
         {"role": "user", "content": json.dumps("tool_results")}
     )
-    assert not agent._is_tool_result_message(
+    assert not compactor._is_tool_result_message(
         {"role": "user", "content": json.dumps({"tool_results": {}})}
     )
-    assert not agent._is_tool_result_message({"role": "user", "content": None})
+    assert not compactor._is_tool_result_message({"role": "user", "content": None})
 
 
 def test_fold_old_tool_results_keeps_recent_and_roles():
@@ -348,7 +487,7 @@ def test_fold_old_tool_results_keeps_recent_and_roles():
 
     original_messages = list(agent.messages)
     for i in range(5):
-        agent.messages.append(
+        agent.session_state.append_message(
             {
                 "role": "user",
                 "content": json.dumps(
@@ -360,7 +499,7 @@ def test_fold_old_tool_results_keeps_recent_and_roles():
                                 "result": {
                                     "ok": True,
                                     "err": "",
-                                    "data": f"large result {i}",
+                                    "data": f"large result {i} " * 20,
                                 },
                             }
                         ]
@@ -370,20 +509,29 @@ def test_fold_old_tool_results_keeps_recent_and_roles():
                 "_test_extra_field": f"keep {i}",
             }
         )
-        agent.messages.append({"role": "assistant", "content": f"assistant {i}"})
+        agent.session_state.append_message(
+            {"role": "assistant", "content": f"assistant {i}"}
+        )
 
     before_len = len(agent.messages)
     before_roles = [msg["role"] for msg in agent.messages]
+    before_ids = [record.id for record in agent.session_state.message_records]
 
-    assert agent._fold_old_tool_results() == 3
+    compactor = agent.compactor
+    folded_count, token_savings = compactor._fold_old_tool_results(
+        agent.session_state.message_records
+    )
+    assert folded_count == 3
+    assert token_savings > 0
     assert len(agent.messages) == before_len
     assert [msg["role"] for msg in agent.messages] == before_roles
-    assert agent.messages[: len(original_messages)] == original_messages
+    assert [record.id for record in agent.session_state.message_records] == before_ids
+    assert list(agent.messages[: len(original_messages)]) == original_messages
 
     tool_result_messages = [
         json.loads(msg["content"])
         for msg in agent.messages
-        if agent._is_tool_result_message(msg)
+        if compactor._is_tool_result_message(msg)
     ]
 
     assert len(tool_result_messages) == 5
@@ -398,7 +546,8 @@ def test_fold_old_tool_results_keeps_recent_and_roles():
     folded_messages = [
         msg
         for msg in agent.messages
-        if agent._is_tool_result_message(msg) and json.loads(msg["content"]).get("folded")
+        if compactor._is_tool_result_message(msg)
+        and json.loads(msg["content"]).get("folded")
     ]
     assert [msg["_test_extra_field"] for msg in folded_messages] == [
         "keep 0",
@@ -408,13 +557,16 @@ def test_fold_old_tool_results_keeps_recent_and_roles():
 
     for recent_idx, recent in enumerate(tool_result_messages[3:], start=3):
         assert "folded" not in recent
-        assert recent["tool_results"][0]["result"]["data"] == f"large result {recent_idx}"
+        assert (
+            recent["tool_results"][0]["result"]["data"]
+            == f"large result {recent_idx} " * 20
+        )
 
 
 def test_fold_old_tool_results_is_idempotent():
     agent = _make_agent([], tool_timeout=5, keep_recent_tool_results=1)
     for i in range(3):
-        agent.messages.append(
+        agent.session_state.append_message(
             {
                 "role": "user",
                 "content": json.dumps(
@@ -432,14 +584,21 @@ def test_fold_old_tool_results_is_idempotent():
             }
         )
 
-    assert agent._fold_old_tool_results() == 2
+    compactor = agent.compactor
+    folded_count, _ = compactor._fold_old_tool_results(
+        agent.session_state.message_records
+    )
+    assert folded_count == 2
     after_first_fold = list(agent.messages)
-    assert agent._fold_old_tool_results() == 0
-    assert agent.messages == after_first_fold
+    folded_count2, savings2 = compactor._fold_old_tool_results(
+        agent.session_state.message_records
+    )
+    assert folded_count2 == 0 and savings2 == 0
+    assert list(agent.messages) == after_first_fold
 
 
 def _append_tool_result_message(agent: Agent, idx: int) -> None:
-    agent.messages.append(
+    agent.session_state.append_message(
         {
             "role": "user",
             "content": json.dumps(
@@ -451,7 +610,7 @@ def _append_tool_result_message(agent: Agent, idx: int) -> None:
                             "result": {
                                 "ok": True,
                                 "err": "",
-                                "data": f"large result {idx}",
+                                "data": f"large result content that is long enough to make folding save tokens {idx}" * 5,
                             },
                         }
                     ]
@@ -462,61 +621,55 @@ def _append_tool_result_message(agent: Agent, idx: int) -> None:
     )
 
 
-def test_compact_context_if_needed_folds_and_reports():
-    renderer = RecordingRenderer()
+def _make_compactor_agent(renderer, keep_recent_tool_results, watermark=0.75):
     llm = LLMClient(
         base_url="http://x", api_key="sk-x", model="m", context_limit=100
     )
-    agent = Agent(
+    return Agent(
         llm,
         [],
         _make_session(),
         renderer,
         tool_timeout=5,
-        context_watermark=0.75,
-        keep_recent_tool_results=2,
+        context_watermark=watermark,
+        keep_recent_tool_results=keep_recent_tool_results,
     )
-    agent.session_state.last_usage = UsageRecord(
-        prompt_tokens=80, completion_tokens=10, total_tokens=90
-    )
+
+
+def test_compact_context_if_needed_folds_and_reports():
+    """running total 超过水位 → 触发折叠,context_tokens 被扣减而非作废。"""
+    renderer = RecordingRenderer()
+    agent = _make_compactor_agent(renderer, keep_recent_tool_results=2)
 
     for i in range(5):
         _append_tool_result_message(agent, i)
 
+    # 把 context_tokens 设到水位线以上(水位 = 100 * 0.75 = 75)
+    agent.session_state.context_tokens = 80
+
     assert agent._compact_context_if_needed() == 3
-    assert agent.session_state.last_usage is None
-    assert renderer.context_compacts == [
-        {
-            "folded_count": 3,
-            "prompt_tokens": 80,
-            "context_limit": 100,
-            "context_watermark": 0.75,
-        }
-    ]
+    # running total 被扣减(而不是作废),值应该变小
+    assert agent.session_state.context_tokens < 80
+
+    assert len(renderer.context_compacts) == 1
+    report = renderer.context_compacts[0]
+    assert report["folded_count"] == 3
+    assert report["context_limit"] == 100
+    assert report["context_watermark"] == 0.75
+    assert report["prompt_tokens"] == 80  # 上报的是触发时的 context_tokens
 
 
 def test_compact_context_if_needed_reports_when_nothing_to_fold():
+    """context_tokens 已越线但没有可折的旧结果:仍要上报,context_tokens 不变。"""
     renderer = RecordingRenderer()
-    llm = LLMClient(
-        base_url="http://x", api_key="sk-x", model="m", context_limit=100
-    )
-    agent = Agent(
-        llm,
-        [],
-        _make_session(),
-        renderer,
-        tool_timeout=5,
-        context_watermark=0.75,
-        keep_recent_tool_results=3,
-    )
-    agent.session_state.last_usage = UsageRecord(
-        prompt_tokens=80, completion_tokens=10, total_tokens=90
-    )
+    agent = _make_compactor_agent(renderer, keep_recent_tool_results=3)
+
+    # context_tokens 80 > 水位 75,但没有可折的旧工具结果
+    agent.session_state.context_tokens = 80
 
     assert agent._compact_context_if_needed() == 0
-    assert agent.session_state.last_usage == UsageRecord(
-        prompt_tokens=80, completion_tokens=10, total_tokens=90
-    )
+    # 没折成,running total 不变
+    assert agent.session_state.context_tokens == 80
     assert renderer.context_compacts == [
         {
             "folded_count": 0,
@@ -528,29 +681,64 @@ def test_compact_context_if_needed_reports_when_nothing_to_fold():
 
 
 def test_compact_context_if_needed_skips_below_watermark():
+    """context_tokens 在水位下就什么都不做,也不上报。"""
     renderer = RecordingRenderer()
-    llm = LLMClient(
-        base_url="http://x", api_key="sk-x", model="m", context_limit=100
-    )
-    agent = Agent(
-        llm,
-        [],
-        _make_session(),
-        renderer,
-        tool_timeout=5,
-        context_watermark=0.75,
-        keep_recent_tool_results=1,
-    )
-    agent.session_state.last_usage = UsageRecord(prompt_tokens=75, completion_tokens=0, total_tokens=75)
+    agent = _make_compactor_agent(renderer, keep_recent_tool_results=1)
+
+    # context_tokens 70 < 水位 75,不触发
+    agent.session_state.context_tokens = 70
 
     assert agent._compact_context_if_needed() == 0
     assert renderer.context_compacts == []
+
+
+def test_running_total_calibrated_by_usage():
+    """record_usage_for_turn 把 running total 校准回 P+C 真值,消灭估算误差。"""
+    session = _make_session("calibration test")
+
+    # 模拟追加了一些消息,running total 是估算值(可能不准)
+    session.append_message({"role": "user", "content": "hello world"})
+    estimated_before = session.context_tokens
+    assert estimated_before > 0
+
+    # 模拟 record_assistant_turn + record_usage
+    turn = session.record_assistant_turn(
+        assistant_raw='{"tool_calls":[],"final_answer":"done"}',
+        parsed={"tool_calls": [], "final_answer": "done"},
+        route="final",
+    )
+    session.record_usage_for_turn(
+        turn, UsageRecord(prompt_tokens=500, completion_tokens=50, total_tokens=550)
+    )
+    # 校准后 context_tokens = P+C = 550,不再是之前的估算值
+    assert session.context_tokens == 550
+
+
+def test_running_total_append_message_increments():
+    """append_message 是唯一入口,每次追加都增量累加 running total。"""
+    session = _make_session("increment test")
+    before = session.context_tokens
+    message_id = session.append_message(
+        {"role": "user", "content": "a]" * 100}
+    )  # 200 chars ~= 50 tokens
+    after = session.context_tokens
+    assert message_id == "msg_1"
+    assert after > before
+    assert after - before == 50  # 200 chars // 4
+
+    turn = session.record_assistant_turn(
+        assistant_raw='{"tool_calls":[],"final_answer":"done"}',
+        parsed={"tool_calls": [], "final_answer": "done"},
+        route="final",
+    )
+    assert turn.message_id == "msg_2"
 
 
 if __name__ == "__main__":
     test_agent_does_not_duplicate_system_prompt_for_existing_session()
     test_parallel_timeout_fills_fail()
     test_inner_timeout_clamped_to_budget()
+    test_tool_runtime_is_separate_from_model_arguments()
     test_tool_exception_becomes_fail()
     test_run_turn_records_usage()
     test_run_turn_records_dict_usage()
@@ -558,11 +746,16 @@ if __name__ == "__main__":
     test_session_records_tool_turn_and_execution()
     test_session_rejects_duplicate_tool_ids_without_partial_state()
     test_session_records_invalid_usage_and_status()
+    test_assistant_raw_uses_stable_message_id_after_non_assistant_reorder()
     test_run_defaults_to_session_max_steps()
+    test_run_aborts_after_consecutive_invalid()
+    test_consecutive_invalid_resets_on_success()
     test_is_tool_result_message_only_accepts_valid_tool_results()
     test_fold_old_tool_results_keeps_recent_and_roles()
     test_fold_old_tool_results_is_idempotent()
     test_compact_context_if_needed_folds_and_reports()
     test_compact_context_if_needed_reports_when_nothing_to_fold()
     test_compact_context_if_needed_skips_below_watermark()
+    test_running_total_calibrated_by_usage()
+    test_running_total_append_message_increments()
     print("all tests passed")

@@ -1,17 +1,21 @@
 from __future__ import annotations
 
-from uuid import uuid4
-from .tools.base import ToolResult, ToolCall
-from pathlib import Path
-from openai.types.chat import ChatCompletionMessageParam
-from typing import Literal, TypeAlias
-
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal, TypeAlias
+from uuid import uuid4
+
+from openai.types.chat import ChatCompletionMessageParam
+
+from .tools.base import ToolResult, ToolCall
+from .util import estimate_message_tokens
 
 CallId: TypeAlias = str
+MessageId: TypeAlias = str
 SessionStatus = Literal["running", "completed", "failed", "max_steps", "waiting_user"]
 TurnRoute = Literal["tool_calls", "final", "invalid"]
-ToolExecutionStatus = Literal["pending", "running", "succeeded", "failed", "timeout"]
+ToolExecutionTerminal = Literal["succeeded", "failed", "timeout"]
+ToolExecutionStatus = Literal["pending", "running"] | ToolExecutionTerminal
 
 
 @dataclass
@@ -24,7 +28,9 @@ class SessionState:
     cwd: Path
 
     turns: list[TurnRecord]
-    messages: list[ChatCompletionMessageParam]  # 可选：模型上下文缓存，不是唯一真实状态
+    # wire 内容唯一存放在 MessageRecord.message;turns 只用稳定 id 贴注解,
+    # 不依赖 message_records 的当前位置。
+    message_records: list[MessageRecord]
 
     tool_executions: dict[CallId, ToolExecutionRecord]
     background_tasks: dict[str, BackgroundTask]
@@ -32,8 +38,14 @@ class SessionState:
     last_usage: UsageRecord | None = None
     total_usage: UsageRecord = field(default_factory=lambda: UsageRecord())
 
+    # 当前 messages 的预测 token 数(= 下次发送会有多大)。增量维护:追加时加、
+    # 折叠时减;每轮拿到 usage 后用 prompt+completion 校准回服务端真值
+    # (见 record_usage_for_turn),估算误差从不累积超过一轮的工具结果尾巴。
+    context_tokens: int = 0
+
     step_count: int = 0
     max_steps: int = 25
+    message_id_counter: int = 0
 
     @classmethod
     def create(
@@ -46,7 +58,7 @@ class SessionState:
             workspace_dir=workspace_dir,
             cwd=workspace_dir,
             turns=[],
-            messages=[],
+            message_records=[],
             tool_executions={},
             background_tasks={},
             max_steps=max_steps,
@@ -55,6 +67,49 @@ class SessionState:
     def _next_step(self) -> int:
         self.step_count += 1
         return self.step_count
+
+    def _next_message_id(self) -> MessageId:
+        self.message_id_counter += 1
+        return f"msg_{self.message_id_counter}"
+
+    @property
+    def messages(self) -> tuple[ChatCompletionMessageParam, ...]:
+        """只读兼容视图:外部不能靠 append 绕过 SessionState.append_message。"""
+        return tuple(self.wire_messages())
+
+    def wire_messages(self) -> list[ChatCompletionMessageParam]:
+        """投影出发给 LLM 的纯 OpenAI wire messages,不携带内部 message_id。"""
+        return [record.message for record in self.message_records]
+
+    def append_message(self, message: ChatCompletionMessageParam) -> MessageId:
+        """把一条消息落进 wire 记录,同步累加 running total,返回稳定 id。
+
+        这是 wire 的【唯一追加入口】:context_tokens 要准,就不能让任何人绕过它
+        直接改 message_records。追加时用估算累加;assistant 那条的估算会在
+        record_usage_for_turn 里被 prompt+completion 精确校准覆盖掉。
+        """
+        message_id = self._next_message_id()
+        self.message_records.append(MessageRecord(id=message_id, message=message))
+        self.context_tokens += estimate_message_tokens(message)
+        return message_id
+
+    def _append_assistant_message(self, content: str) -> MessageId:
+        """把这轮 assistant 原文落进 wire 记录,返回它的稳定 id。
+
+        turns 只存 message_id 来【引用】原文,不再复制一份字符串:
+        wire 内容唯一存放在 MessageRecord.message,turns 是按 id 贴在上面的注解层。
+        compaction 可以改写/删除/合并非 assistant 记录,但被 turn 引用的
+        assistant 记录必须保留,除非未来把 assistant 原文归档到 TurnRecord。
+        """
+        return self.append_message({"role": "assistant", "content": content})
+
+    def assistant_raw(self, turn: TurnRecord) -> str:
+        """按 turn 记的 message_id 取回这轮 assistant 原文。"""
+        for record in self.message_records:
+            if record.id == turn.message_id:
+                content = record.message.get("content")
+                return content if isinstance(content, str) else ""
+        raise KeyError(f"Assistant message not found: {turn.message_id}")
 
     def record_assistant_turn(
         self,
@@ -84,7 +139,10 @@ class SessionState:
 
             tool_execution_ids.append(tool_call.id)
 
+        # 校验全部通过后才落 wire / 改状态:
+        # 上面任一 raise 都不能留下半截 message 或 tool_execution。
         step = self._next_step()
+        message_id = self._append_assistant_message(assistant_raw)
 
         for tool_call in tool_calls:
             self.tool_executions[tool_call.id] = ToolExecutionRecord(
@@ -96,7 +154,7 @@ class SessionState:
 
         turn = TurnRecord(
             step=step,
-            assistant_raw=assistant_raw,
+            message_id=message_id,
             parsed=parsed,
             route=route,
             tool_execution_ids=tool_execution_ids,
@@ -112,9 +170,11 @@ class SessionState:
         parsed: dict | None = None,
     ) -> "TurnRecord":
         """记录一轮无效 assistant 输出,比如 JSON 解析失败或 route 失败。"""
+        step = self._next_step()
+        message_id = self._append_assistant_message(assistant_raw)
         turn = TurnRecord(
-            step=self._next_step(),
-            assistant_raw=assistant_raw,
+            step=step,
+            message_id=message_id,
             parsed=parsed or {},
             route="invalid",
             tool_execution_ids=[],
@@ -127,7 +187,7 @@ class SessionState:
         self,
         call_id: CallId,
         result: ToolResult,
-        status: Literal["succeeded", "failed", "timeout"] | None = None,
+        status: ToolExecutionTerminal | None = None,
         started_at: float | None = None,
         ended_at: float | None = None,
     ) -> ToolExecutionRecord:
@@ -148,6 +208,10 @@ class SessionState:
     def record_usage_for_turn(self, turn: "TurnRecord", usage: "UsageRecord") -> None:
         turn.usage = usage
         self.last_usage = usage
+        # 校准 running total:此刻 assistant 已入队、工具结果尚未追加,
+        # prompt_tokens + completion_tokens 就是当前 wire 记录的精确大小——
+        # 用它覆盖 context_tokens,一次性消灭之前累积的估算误差。
+        self.context_tokens = usage.prompt_tokens + usage.completion_tokens
         self.total_usage.prompt_tokens += usage.prompt_tokens
         self.total_usage.completion_tokens += usage.completion_tokens
         self.total_usage.total_tokens += usage.total_tokens
@@ -157,6 +221,15 @@ class SessionState:
 
     def mark_max_steps(self) -> None:
         self.status = "max_steps"
+
+    def mark_failed(self) -> None:
+        self.status = "failed"
+
+
+@dataclass
+class MessageRecord:
+    id: MessageId
+    message: ChatCompletionMessageParam
 
 
 @dataclass
@@ -175,11 +248,33 @@ class UsageRecord:
     completion_tokens: int = 0
     total_tokens: int = 0
 
+    @classmethod
+    def from_usage(cls, usage: Any) -> "UsageRecord":
+        """把 LLM 原始 usage 归一成 UsageRecord。
+
+        原始 usage 形态不一:有的接口给 dict,有的给带属性的对象(SDK 模型),
+        这种"形状差异"的知识收在这里,主循环不该操心。total 缺省时用
+        prompt + completion 兜底。
+        """
+        if isinstance(usage, dict):
+            prompt_tokens = int(usage.get("prompt_tokens") or 0)
+            completion_tokens = int(usage.get("completion_tokens") or 0)
+            total_tokens = usage.get("total_tokens")
+        else:
+            prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+            completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+            total_tokens = getattr(usage, "total_tokens", None)
+
+        if total_tokens is None:
+            total_tokens = prompt_tokens + completion_tokens
+
+        return cls(prompt_tokens, completion_tokens, int(total_tokens or 0))
+
 
 @dataclass
 class TurnRecord:
     step: int
-    assistant_raw: str
+    message_id: MessageId  # 指向这轮 assistant wire 记录,引用而非复制原文
     parsed: dict
     route: TurnRoute
 

@@ -1,5 +1,6 @@
 # 文件操作工具链
 from pathlib import Path
+from ..permission_types import PermissionCheckResult
 from .base import Tool, ToolResult
 
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent / "workspace"
@@ -101,6 +102,26 @@ def edit_file(file: str, old_text: str, new_text: str):
         return ToolResult.fail(str(e))
 
 
+def _ask_file_write(args: dict, runtime) -> PermissionCheckResult:
+    flags = ("writes_files",)
+    return PermissionCheckResult(
+        "ask",
+        f"{runtime.tool_name}: requires user approval by file tool policy; risks={', '.join(flags)}",
+        flags,
+        source="tool",
+    )
+
+
+def _ask_file_edit(args: dict, runtime) -> PermissionCheckResult:
+    flags = ("reads_files", "writes_files")
+    return PermissionCheckResult(
+        "ask",
+        f"{runtime.tool_name}: requires user approval by file tool policy; risks={', '.join(flags)}",
+        flags,
+        source="tool",
+    )
+
+
 list_files_tool = Tool(
     name="list_files",
     description="List all files in a specified directory.",
@@ -114,7 +135,8 @@ list_files_tool = Tool(
         },
         "required": ["directory"],
     },
-    func=list_files,
+    call=lambda args, runtime: list_files(**args),
+    concurrency="parallel",
 )
 
 read_file_tool = Tool(
@@ -130,7 +152,8 @@ read_file_tool = Tool(
         },
         "required": ["file"],
     },
-    func=read_file,
+    call=lambda args, runtime: read_file(**args),
+    concurrency="parallel",
 )
 
 write_file_tool = Tool(
@@ -155,7 +178,9 @@ write_file_tool = Tool(
         },
         "required": ["file", "content"],
     },
-    func=write_file,
+    call=lambda args, runtime: write_file(**args),
+    check_permission=_ask_file_write,
+    concurrency="serial",
 )
 
 
@@ -180,5 +205,7 @@ edit_file_tool = Tool(
         },
         "required": ["file", "old_text", "new_text"],
     },
-    func=edit_file,
+    call=lambda args, runtime: edit_file(**args),
+    check_permission=_ask_file_edit,
+    concurrency="serial",
 )

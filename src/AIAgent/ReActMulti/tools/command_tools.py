@@ -6,9 +6,9 @@ import tempfile
 import threading
 import uuid
 from pathlib import Path
-from typing import Callable
 
-from .base import Tool, ToolResult
+from .base import Tool, ToolResult, ToolRuntime
+from .command_permissions import check_execute_command_permission
 
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent / "workspace"
 WORKSPACE_DIR.mkdir(exist_ok=True)
@@ -36,7 +36,9 @@ _tasks: dict[str, dict] = {}
 _tasks_lock = threading.Lock()
 
 
-def _register_task(task_id: str, proc: subprocess.Popen, lines: list[str], done: threading.Event) -> None:
+def _register_task(
+    task_id: str, proc: subprocess.Popen, lines: list[str], done: threading.Event
+) -> None:
     with _tasks_lock:
         _tasks[task_id] = {"proc": proc, "lines": lines, "done": done}
 
@@ -49,12 +51,14 @@ def get_task_output(task_id: str) -> ToolResult:
         return ToolResult.fail(f"Unknown task_id: {task_id}")
     done = task["done"].is_set()
     output = "".join(task["lines"])
-    return ToolResult.success({
-        "task_id": task_id,
-        "done": done,
-        "returncode": task["proc"].returncode if done else None,
-        "output": output[-8000:],
-    })
+    return ToolResult.success(
+        {
+            "task_id": task_id,
+            "done": done,
+            "returncode": task["proc"].returncode if done else None,
+            "output": output[-8000:],
+        }
+    )
 
 
 # ── execute_command ───────────────────────────────────────────────────────────
@@ -66,14 +70,14 @@ def execute_command(
     command: str,
     timeout: int = 20,
     run_in_background: bool = False,
-    on_output: Callable[[str], None] | None = None,
+    runtime: ToolRuntime | None = None,
 ) -> ToolResult:
     """
     执行 shell 命令，对齐 Claude Code BashTool 的核心机制：
 
     - cwd 注入法：在命令末尾追加 `&& pwd -P > $tmpfile`，命令执行完后
       读回临时文件来更新 session cwd，能正确捕获命令内部 cd 的效果。
-    - 流式输出：后台读线程实时触发 on_output 回调。
+    - 流式输出：后台读线程实时触发 runtime 里的输出回调。
     - 超时转后台：前台命令超时后不 kill，转为后台任务返回 task_id。
     - run_in_background：立即后台运行，返回 task_id。
     """
@@ -84,7 +88,9 @@ def execute_command(
         cwd_file = Path(tempfile.mktemp(prefix="react-cwd-"))
         # 末尾追加 `&& pwd -P > tmpfile`，无论命令成败都不影响返回码
         # （pwd -P 只在主命令成功时才写，和 Claude Code 的 &&  行为一致）
-        injected = f"eval {shlex.quote(command)} && pwd -P > {shlex.quote(str(cwd_file))}"
+        injected = (
+            f"eval {shlex.quote(command)} && pwd -P > {shlex.quote(str(cwd_file))}"
+        )
 
         proc = subprocess.Popen(
             ["/bin/bash", "-c", injected],
@@ -95,7 +101,9 @@ def execute_command(
             bufsize=1,
         )
     except FileNotFoundError:
-        return ToolResult.fail(f"命令不存在: {command.split()[0] if command.split() else command}")
+        return ToolResult.fail(
+            f"命令不存在: {command.split()[0] if command.split() else command}"
+        )
     except Exception as e:
         return ToolResult.fail(f"{type(e).__name__}: {e}")
 
@@ -103,10 +111,11 @@ def execute_command(
     done_event = threading.Event()
 
     def _reader():
+        assert proc.stdout is not None
         for line in proc.stdout:
             output_lines.append(line)
-            if on_output:
-                on_output(line)
+            if runtime and runtime.emit_output:
+                runtime.emit_output(line)
         proc.wait()
         # 先更新 cwd，再 set done_event，保证调用方 wait() 返回时 cwd 已就绪
         _read_cwd_file(cwd_file)
@@ -117,10 +126,12 @@ def execute_command(
     if run_in_background:
         task_id = f"task_{uuid.uuid4().hex[:8]}"
         _register_task(task_id, proc, output_lines, done_event)
-        return ToolResult.success({
-            "task_id": task_id,
-            "message": f"命令已在后台运行，用 get_task_output('{task_id}') 查结果。",
-        })
+        return ToolResult.success(
+            {
+                "task_id": task_id,
+                "message": f"命令已在后台运行，用 get_task_output('{task_id}') 查结果。",
+            }
+        )
 
     finished = done_event.wait(timeout=timeout)
 
@@ -128,12 +139,14 @@ def execute_command(
         # 超时：不 kill，转后台
         task_id = f"task_{uuid.uuid4().hex[:8]}"
         _register_task(task_id, proc, output_lines, done_event)
-        return ToolResult.success({
-            "task_id": task_id,
-            "timed_out": True,
-            "message": f"命令超过 {timeout}s 未完成，已转为后台任务 {task_id}。",
-            "output_so_far": "".join(output_lines)[-MAX_OUTPUT_CHARS:],
-        })
+        return ToolResult.success(
+            {
+                "task_id": task_id,
+                "timed_out": True,
+                "message": f"命令超过 {timeout}s 未完成，已转为后台任务 {task_id}。",
+                "output_so_far": "".join(output_lines)[-MAX_OUTPUT_CHARS:],
+            }
+        )
 
     output = "".join(output_lines)
     if len(output) > MAX_OUTPUT_CHARS:
@@ -196,7 +209,10 @@ execute_command_tool = Tool(
         },
         "required": ["command"],
     },
-    func=execute_command,
+    call=lambda args, runtime: execute_command(**args, runtime=runtime),
+    check_permission=check_execute_command_permission,
+    # 会改 session cwd、跑任意 shell,副作用最大 → 必须串行。
+    concurrency="serial",
 )
 
 get_task_output_tool = Tool(
@@ -212,5 +228,6 @@ get_task_output_tool = Tool(
         },
         "required": ["task_id"],
     },
-    func=get_task_output,
+    call=lambda args, runtime: get_task_output(**args),
+    concurrency="parallel",
 )

@@ -2,6 +2,7 @@ import httpx
 import os
 from typing import Any
 
+from ..permission_types import PermissionCheckResult
 from .base import Tool, ToolResult
 
 
@@ -66,6 +67,16 @@ def http_request(
     return ToolResult.success({"response": body, "truncated": truncated})
 
 
+def _ask_http_request(args: dict, runtime) -> PermissionCheckResult:
+    flags = ("accesses_network",)
+    return PermissionCheckResult(
+        "ask",
+        f"{runtime.tool_name}: requires user approval by web tool policy; risks={', '.join(flags)}",
+        flags,
+        source="tool",
+    )
+
+
 web_search_tool = Tool(
     name="web_search",
     description="Search the web for information.",
@@ -80,7 +91,8 @@ web_search_tool = Tool(
         },
         "required": ["query", "max_results"],
     },
-    func=web_search,
+    call=lambda args, runtime: web_search(**args),
+    concurrency="parallel",
 )
 
 http_request_tool = Tool(
@@ -109,5 +121,8 @@ http_request_tool = Tool(
         },
         "required": ["url"],
     },
-    func=http_request,
+    call=lambda args, runtime: http_request(**args),
+    check_permission=_ask_http_request,
+    # 即使是 POST/PUT,副作用也落在远端,不与本地 workspace 抢资源 → 可并发。
+    concurrency="parallel",
 )

@@ -1,0 +1,156 @@
+from __future__ import annotations
+
+from dataclasses import replace
+from pathlib import Path
+from typing import Callable
+
+from .permission_types import PermissionCheckResult
+from .tools.base import Tool, ToolCall, ToolRuntime
+
+
+PermissionApprovalHandler = Callable[["PermissionRequest"], "PermissionCheckResult"]
+
+
+class PermissionPolicy:
+    """通用权限策略层。
+
+    不认识具体工具名,也不解析具体工具参数。工具相关策略由 Tool.check_permission
+    提供;这里只追加所有工具都适用的系统边界检查。
+    """
+
+    def apply(
+        self,
+        check: PermissionCheckResult,
+        cwd: Path,
+        workspace_dir: Path,
+    ) -> PermissionCheckResult:
+        risk_flags = list(check.risk_flags)
+
+        resolved_cwd = cwd.resolve()
+        resolved_workspace = workspace_dir.resolve()
+        if not resolved_cwd.is_relative_to(resolved_workspace):
+            risk_flags.append("cwd_outside_workspace")
+
+        merged_flags = tuple(dict.fromkeys(risk_flags))
+        if merged_flags == check.risk_flags:
+            return check
+
+        return replace(
+            check,
+            risk_flags=merged_flags,
+            reason=self._format_reason(check.reason, merged_flags),
+        )
+
+    def _format_reason(self, reason: str, risk_flags: tuple[str, ...]) -> str:
+        prefix = reason.split("; risks=", 1)[0]
+        suffix = f"; risks={', '.join(risk_flags)}" if risk_flags else ""
+        return f"{prefix}{suffix}"
+
+
+class PermissionRequest:
+    """需要外部裁决的权限请求。
+
+    类似 Claude Code 的 canUseTool/permission dialog 边界:工具只能判断
+    "需要问",真正是否允许由这里的 handler 决定。当前项目还没有交互 UI,
+    所以没有 handler 时 ask 会 fail closed。
+    """
+
+    def __init__(
+        self,
+        tool_call: ToolCall,
+        tool: Tool,
+        arguments: dict,
+        runtime: ToolRuntime,
+        check: PermissionCheckResult,
+        cwd: Path,
+        workspace_dir: Path,
+    ):
+        self.tool_call = tool_call
+        self.tool = tool
+        self.arguments = arguments
+        self.runtime = runtime
+        self.check = check
+        self.cwd = cwd
+        self.workspace_dir = workspace_dir
+
+
+class PermissionResolver:
+    """把工具权限判断解析成最终执行判定。
+
+    分层目的:
+    - Tool.check_permission: 工具自己的 allow/ask/deny 与内容风险识别。
+    - PermissionPolicy: 通用系统边界检查,不硬编码具体工具。
+    - PermissionApprovalHandler: 用户确认、CLI prompt、测试注入、未来 hooks。
+    - ToolExecutor: 只消费最终 allow/deny/ask,不硬编码交互细节。
+    """
+
+    def __init__(
+        self,
+        policy: PermissionPolicy | None = None,
+        approval_handler: PermissionApprovalHandler | None = None,
+    ):
+        self.policy = policy or PermissionPolicy()
+        self.approval_handler = approval_handler
+
+    def resolve(
+        self,
+        tool_call: ToolCall,
+        tool: Tool,
+        runtime: ToolRuntime,
+        cwd: Path,
+        workspace_dir: Path,
+    ) -> PermissionCheckResult:
+        arguments = dict(tool_call.arguments)
+        try:
+            tool_check = tool.check_permission(arguments, runtime)
+        except Exception as e:
+            tool_check = PermissionCheckResult(
+                "deny",
+                f"{tool.name}: permission check failed: {type(e).__name__}: {e}",
+                source="tool_permission_error",
+            )
+
+        check = self.policy.apply(tool_check, cwd, workspace_dir)
+        if check.decision != "ask":
+            return check
+
+        if self.approval_handler is None:
+            return check
+
+        try:
+            decision = self.approval_handler(
+                PermissionRequest(
+                    tool_call=tool_call,
+                    tool=tool,
+                    arguments=arguments,
+                    runtime=runtime,
+                    check=check,
+                    cwd=cwd,
+                    workspace_dir=workspace_dir,
+                )
+            )
+        except Exception as e:
+            return PermissionCheckResult(
+                "deny",
+                f"permission approval handler failed: {type(e).__name__}: {e}",
+                check.risk_flags,
+                source="approval_handler_error",
+            )
+
+        if decision.decision not in ("allow", "deny", "ask"):
+            return PermissionCheckResult(
+                "deny",
+                f"permission approval handler returned invalid decision: {decision.decision!r}",
+                check.risk_flags,
+                source="approval_handler_error",
+            )
+
+        merged_flags = tuple(dict.fromkeys((*check.risk_flags, *decision.risk_flags)))
+        if merged_flags != decision.risk_flags:
+            return replace(
+                decision,
+                risk_flags=merged_flags,
+                reason=self.policy._format_reason(decision.reason, merged_flags),
+            )
+
+        return decision

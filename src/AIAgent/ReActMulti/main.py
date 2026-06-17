@@ -35,18 +35,27 @@ if __name__ == "__main__":
         base_url=base_url,
         api_key=api_key,
         model=model,
-        context_limit=context_limit or 2000,
+        context_limit=context_limit or 128000,
     )
     renderer = ConsoleRenderer()
 
-    prompt = "执行命令查看当前主机信息，查看装了那些应用"
+    prompt = (
+        "请在同一个回合里一次性发起下面所有操作（不要分多轮）："
+        "1) 用 web_search 搜索『2024 巴黎奥运会』；"
+        "2) 对 https://ifconfig.me/ip 发 http 请求拿公网 IP；"
+        "3) 执行命令 uname -a 查看主机信息；"
+        "4) 把内容『hello』写入 a.txt；"
+        "5) 把内容『world』写入 b.txt。"
+        "全部做完后用 final_answer 汇总结果。"
+    )
     session_state = SessionState.create(
         user_goal=prompt,
         workspace_dir=Path(__file__).resolve().parent / "workspace",
     )
-    agent = Agent(llm_client, tools, session_state, renderer, keep_recent_tool_results=1)
+    agent = Agent(llm_client, tools, session_state, renderer, keep_recent_tool_results=3)
 
     agent.run(
         # "执行 python 代码 print(1/0)，并且用 web_search 搜索 2024 年奥运会在哪举办，再对 ifconfig.me/ip 发起 http 请求拿到公网 IP。执行命令查看当前主机信息"
         prompt
+        # '写一个坦克大战游戏项目，有完整的开发流程'
     )

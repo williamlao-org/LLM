@@ -1,62 +1,26 @@
-import uuid
 import json
-from typing import Literal, Any
 from openai.types.chat import ChatCompletionMessageParam
 
 from .tools.base import ToolCall, ToolResult
 
+# 入站解析(模型输出 → 结构化回合)已搬到 protocol.py。
+# 本模块只留出站编码:把工具执行结果拼回喂给模型的 wire 消息。
 
-class TurnAbort(Exception):
-    """本轮 LLM 输出无法解析或路由,这一轮没法继续。
-
-    与"单个工具失败"区分开:工具失败是数据(ToolResult.fail),整轮照常;
-    TurnAbort 是整轮中止,只能把错误喂回 LLM 让它重答。
-    主循环专门捕获它,其它异常一律放行(那是真 bug,不该被静默吞掉)。
-    """
-
-
-def llm_json_parser(llm_content: str) -> dict:
-    """从 LLM 回复文本里抠出最外层 { } 之间的 JSON 并解析。
-
-    找不到 { } 或 JSON 非法 → 本轮没法路由 → 抛 TurnAbort。
-    """
-    try:
-        start = llm_content.index("{")
-        end = llm_content.rindex("}")
-        return json.loads(llm_content[start : end + 1])
-    except (ValueError, json.JSONDecodeError) as e:
-        # .index 找不到子串抛 ValueError;json.loads 非法抛 JSONDecodeError
-        raise TurnAbort(f"LLM 输出不是合法 JSON: {e}") from e
+# 糙估系数:按英文/JSON 经验 ~4 字符/token,中文会偏小。它只用于"还没被服务端
+# usage 校准的那截尾巴"(running total 每轮会被 P+C 校准回真值),误差被限制在一轮
+# 工具输出内。要精确就换 tiktoken(OpenAI) 或 count_tokens 接口(Anthropic),接口不变。
+CHARS_PER_TOKEN = 4
 
 
-def parse_tool_calls(raw_calls: list[dict]) -> list[ToolCall]:
-    """把 LLM 给的一批 raw dict 解析成 ToolCall 列表。
-    非法的不抛异常,而是造一个带 error 的占位,交给执行阶段统一 fail。"""
-    tool_calls: list[ToolCall] = []
-    for raw in raw_calls:
-        call_id = f"call_{uuid.uuid4().hex[:6]}"  # 先盖章,跟合不合法无关
-        try:
-            tool_calls.append(ToolCall.from_dict(raw, call_id))
-        except (ValueError, KeyError) as e:
-            tool_calls.append(
-                ToolCall(
-                    name="", arguments={}, id=call_id, error=f"非法 tool_call: {e}"
-                )
-            )
-    return tool_calls
+def estimate_tokens(text: str) -> int:
+    """按字符数糙估一段文本的 token 数。"""
+    return len(text) // CHARS_PER_TOKEN
 
 
-def route(
-    content_json: dict,
-) -> tuple[Literal["final", "tool_calls"], Any]:
-    tool_calls = content_json.get("tool_calls")
-    final_answer = content_json.get("final_answer")
-    if tool_calls and final_answer is None:
-        return "tool_calls", tool_calls
-    elif not tool_calls and final_answer:
-        return "final", final_answer
-    else:
-        raise TurnAbort("必须仅存在 tool_calls 或 final_answer")
+def estimate_message_tokens(message: ChatCompletionMessageParam) -> int:
+    """估算单条 wire 消息的 token 数(只数 str 形态的 content)。"""
+    content = message.get("content")
+    return estimate_tokens(content) if isinstance(content, str) else 0
 
 
 def build_tool_results_message(
