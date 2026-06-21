@@ -2,10 +2,15 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
-from .permission_types import PermissionCheckResult
-from .tools.base import Tool, ToolCall, ToolRuntime
+from .types import PermissionCheckResult
+
+if TYPE_CHECKING:
+    # 只在类型注解里用到(配合文件首的 from __future__ import annotations 全部惰性求值),
+    # 放进 TYPE_CHECKING 就不会在运行时 import tools——否则 permission 包与 tools 包会
+    # 形成 import 环(tools/* 要从本包拿 PermissionCheckResult)。
+    from ..tools.base import Tool, ToolCall, ToolRuntime
 
 
 PermissionApprovalHandler = Callable[["PermissionRequest"], "PermissionCheckResult"]
@@ -45,6 +50,34 @@ class PermissionPolicy:
         prefix = reason.split("; risks=", 1)[0]
         suffix = f"; risks={', '.join(risk_flags)}" if risk_flags else ""
         return f"{prefix}{suffix}"
+
+
+class FallbackApprovalHandler:
+    """把多个 handler 串成责任链:第一个明确表态(allow/deny)的说了算。
+
+    机制全靠那条共享签名:每个 handler 吃 PermissionRequest、吐 PermissionCheckResult。
+    约定一个 handler 返回 `ask` 表示"我弃权,交给下一个";返回 allow/deny 即定案,
+    链就此短路。典型用法:[规则式(on_no_match="ask"), 交互式]——规则能自动判的自动判,
+    判不了的(规则弃权)才弹终端问人。全员弃权则 fail-closed 拒。
+
+    它本身也满足 handler 签名,所以可以再被嵌进别的链——组合是闭合的。
+    """
+
+    def __init__(self, *handlers: PermissionApprovalHandler):
+        self.handlers = handlers
+
+    def __call__(self, request: "PermissionRequest") -> PermissionCheckResult:
+        for handler in self.handlers:
+            result = handler(request)
+            if result.decision in ("allow", "deny"):
+                return result
+            # decision == "ask":该 handler 弃权,继续问下一个
+        return PermissionCheckResult(
+            "deny",
+            "no approval handler made a decision",
+            request.check.risk_flags,
+            source="fallback_exhausted",
+        )
 
 
 class PermissionRequest:

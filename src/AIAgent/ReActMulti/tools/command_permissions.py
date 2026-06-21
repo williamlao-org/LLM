@@ -2,7 +2,7 @@ import re
 import shlex
 from pathlib import Path
 
-from ..permission_types import PermissionCheckResult
+from ..permission import PermissionCheckResult
 from .base import ToolRuntime
 
 

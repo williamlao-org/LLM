@@ -1,6 +1,6 @@
 # 文件操作工具链
 from pathlib import Path
-from ..permission_types import PermissionCheckResult
+from ..permission import PermissionCheckResult
 from .base import Tool, ToolResult
 
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent / "workspace"

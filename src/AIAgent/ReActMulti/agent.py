@@ -6,6 +6,7 @@ from openai.types.chat import ChatCompletionMessageParam
 from .context import ContextCompactor
 from .events import ContentDelta, ContentDone, ReasoningDelta, UsageEvent
 from .executor import ToolExecutor
+from .permission import PermissionResolver
 from .llm import LLMClient
 from .prompt import build_system_prompt
 from .renderer import Renderer
@@ -27,10 +28,14 @@ class Agent:
         context_watermark: float = 0.75,
         keep_recent_tool_results: int = 3,
         max_consecutive_invalid: int = 3,
+        permission_resolver: PermissionResolver | None = None,
     ):
         self.llm = llm
         self.session_state = session_state
         self.renderer = renderer
+        # 权限裁决器可由装配层注入(承载规则/模式配置),并沿主→子 Agent 共用同一份;
+        # 不传则 ToolExecutor 自建一个无 handler 的默认 resolver(ask 一律 fail-closed)。
+        self._permission_resolver = permission_resolver
         # 连续 N 轮解析失败就止损:再喂回去也大概率是同样的废 JSON,
         # 与其烧光 max_steps,不如如实标 failed 退出。中间成功一次即清零。
         self.max_consecutive_invalid = max_consecutive_invalid
@@ -61,6 +66,7 @@ class Agent:
             {tool.name: tool for tool in tools},
             tool_timeout=tool_timeout,
             on_command_output=renderer.on_command_output,
+            permission_resolver=permission_resolver,
             workspace_dir=session_state.workspace_dir,
             cwd_provider=get_cwd,
         )

@@ -2,7 +2,7 @@ import httpx
 import os
 from typing import Any
 
-from ..permission_types import PermissionCheckResult
+from ..permission import PermissionCheckResult
 from .base import Tool, ToolResult
 
 

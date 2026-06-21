@@ -7,16 +7,26 @@ ReActMulti Agent 主入口模块（多工具版）
 """
 
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from .agent import Agent
 from .logger import get_logger
-from .tools import tools
+from .tools import tools as base_tools
 from .llm import LLMClient
+from .permission import (
+    FallbackApprovalHandler,
+    InteractiveApprovalHandler,
+    PermissionResolver,
+    RuleBasedApprovalHandler,
+    append_allow_rule,
+    load_permission_settings,
+)
 from .renderer import ConsoleRenderer
 from .session import SessionState
+from .subagent import build_agent_tools
 
 
 logger = get_logger(__name__)
@@ -40,19 +50,61 @@ if __name__ == "__main__":
     renderer = ConsoleRenderer()
 
     prompt = (
-        "请在同一个回合里一次性发起下面所有操作（不要分多轮）："
-        "1) 用 web_search 搜索『2024 巴黎奥运会』；"
-        "2) 对 https://ifconfig.me/ip 发 http 请求拿公网 IP；"
-        "3) 执行命令 uname -a 查看主机信息；"
-        "4) 把内容『hello』写入 a.txt；"
-        "5) 把内容『world』写入 b.txt。"
-        "全部做完后用 final_answer 汇总结果。"
+        "你是主管 Agent。下面有两个相互【独立】的子任务，请用 spawn_agent 把它们"
+        "分别委派给两个子 Agent 完成（不要自己动手做），最后用 final_answer 汇总两个"
+        "子 Agent 的结论：\n"
+        "子任务 A：计算 1 到 100 的整数之和，并把结果写入 sum_a.txt。\n"
+        "子任务 B：用 web_search 查『2024 巴黎奥运会在哪个城市举办』，把答案写入 city_b.txt。"
     )
     session_state = SessionState.create(
         user_goal=prompt,
         workspace_dir=Path(__file__).resolve().parent / "workspace",
     )
-    agent = Agent(llm_client, tools, session_state, renderer, keep_recent_tool_results=3)
+
+    # 权限裁决:加载持久化配置(模式 + allow/deny 规则),按"要不要人"两种装配。
+    #
+    # 要不要人,默认看有没有真终端,不用记环境变量(env 仍可强制覆盖):
+    #   - 有 TTY(你坐在终端前) → 规则 + 人:规则 on_no_match=ask 对灰色地带"弃权",
+    #     落到交互式 handler 弹窗问你;rm/sudo 等 deny 仍直接拒、不打扰你。
+    #   - 无 TTY(管道/CI/后台) → 纯规则,on_no_match=deny 直接 fail-closed,绝不阻塞。
+    # 关键:能不能被问到,取决于规则有没有提前 allow 它——allow 列得越全,落到人手里越少。
+    # 默认配置只 allow 只读命令,所以写文件/网络/python 都会落到你这来确认。
+    # 主 Agent 与所有子 Agent 共用这同一份 resolver,规则/记忆全树一致。
+    settings = load_permission_settings()
+    env_interactive = os.getenv("REACT_PERMISSION_INTERACTIVE")
+    interactive = (
+        env_interactive == "1"
+        if env_interactive is not None
+        else sys.stdin.isatty()
+    )
+    if interactive:
+        approval_handler = FallbackApprovalHandler(
+            RuleBasedApprovalHandler(settings, on_no_match="ask"),
+            # on_remember:用户选"别再问"时把规则写回 settings.json,下次同工具在规则层
+            # 就自动放行(连这个交互 handler 都到不了)——对标 Claude Code 的"Yes, don't ask again"。
+            InteractiveApprovalHandler(on_remember=append_allow_rule),
+        )
+    else:
+        approval_handler = RuleBasedApprovalHandler(settings)
+    permission_resolver = PermissionResolver(approval_handler=approval_handler)
+
+    # 给主 Agent 装上"基础工具 + spawn_agent"的分层工具集:depth=0 是主 Agent,
+    # 它能委派出 depth=1 的子 Agent;到 max_depth 那层不再带 spawn,递归到底。
+    tools = build_agent_tools(
+        llm_client,
+        base_tools,
+        depth=0,
+        max_depth=2,
+        permission_resolver=permission_resolver,
+    )
+    agent = Agent(
+        llm_client,
+        tools,
+        session_state,
+        renderer,
+        keep_recent_tool_results=3,
+        permission_resolver=permission_resolver,
+    )
 
     agent.run(
         # "执行 python 代码 print(1/0)，并且用 web_search 搜索 2024 年奥运会在哪举办，再对 ifconfig.me/ip 发起 http 请求拿到公网 IP。执行命令查看当前主机信息"

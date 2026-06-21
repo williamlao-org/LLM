@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from ..permission_types import PermissionCheckResult
+from ..permission import PermissionCheckResult
 
 # 并发策略:parallel = 只读/无本地副作用,可丢线程池并发;
 # serial = 会改 workspace 或有副作用,必须串行执行。
