@@ -9,6 +9,8 @@
 """
 
 import json
+import threading
+import time
 from pathlib import Path
 
 from .agent import Agent
@@ -42,6 +44,18 @@ class ScriptedLLM:
 def _tool_calls(name: str, **arguments) -> str:
     return json.dumps(
         {"tool_calls": [{"name": name, "arguments": arguments}], "final_answer": None}
+    )
+
+
+def _many_tool_calls(calls: list[tuple[str, dict]]) -> str:
+    return json.dumps(
+        {
+            "tool_calls": [
+                {"name": name, "arguments": arguments}
+                for name, arguments in calls
+            ],
+            "final_answer": None,
+        }
     )
 
 
@@ -153,12 +167,66 @@ def test_child_failure_surfaces_as_failed_tool_result():
     assert payload["result"]["data"]["status"] == "max_steps"
 
 
+def test_multiple_spawn_agents_run_concurrently_and_preserve_result_order():
+    """同一连续批次中的子 Agent 并发执行，父级结果仍按 tool_call 顺序聚合。"""
+
+    class ConcurrentLLM:
+        context_limit = 128_000
+
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.active_children = 0
+            self.max_active_children = 0
+
+        def __call__(self, messages):
+            last = messages[-1]["content"]
+            if last == "并行委派":
+                yield ContentDone(
+                    content=_many_tool_calls([
+                        ("spawn_agent", {"task": "task-a"}),
+                        ("spawn_agent", {"task": "task-b"}),
+                    ])
+                )
+                return
+            if last in {"task-a", "task-b"}:
+                with self.lock:
+                    self.active_children += 1
+                    self.max_active_children = max(
+                        self.max_active_children, self.active_children
+                    )
+                time.sleep(0.1)
+                with self.lock:
+                    self.active_children -= 1
+                yield ContentDone(content=_final(f"done:{last}"))
+                return
+            if isinstance(last, str) and "tool_results" in last:
+                payload = json.loads(last)
+                ordered = [
+                    item["result"]["data"]["result"]
+                    for item in payload["tool_results"]
+                ]
+                yield ContentDone(content=_final("|".join(ordered)))
+                return
+            raise AssertionError(f"unexpected messages: {messages!r}")
+
+    llm = ConcurrentLLM()
+    session = _make_session()
+    tools = build_agent_tools(llm, [], depth=0, max_depth=1)
+    agent = Agent(llm, tools, session, SilentRenderer(), tool_timeout=2)
+
+    result = agent.run("并行委派")
+
+    assert llm.max_active_children == 2
+    assert result == "done:task-a|done:task-b"
+
+
 def _run_all():
     tests = [
         test_spawn_agent_listed_in_parent_tools_but_not_at_max_depth,
         test_parent_delegates_and_aggregates_child_result,
         test_child_context_is_isolated_from_parent,
         test_child_failure_surfaces_as_failed_tool_result,
+        test_multiple_spawn_agents_run_concurrently_and_preserve_result_order,
     ]
     for test in tests:
         test()

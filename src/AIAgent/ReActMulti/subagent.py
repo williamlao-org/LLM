@@ -184,6 +184,7 @@ def make_spawn_agent_tool(
             # 子 Agent 复用主 Agent 同一份权限裁决器:规则/模式全树一致,
             # 不给委派出去的子任务开任何权限后门。
             permission_resolver=permission_resolver,
+            cancellation_check=runtime.is_cancelled,
         )
 
         final_answer = child_agent.run(task, max_steps=child_max_steps)
@@ -216,9 +217,8 @@ def make_spawn_agent_tool(
         description=SPAWN_AGENT_DESCRIPTION,
         parameters=SPAWN_AGENT_PARAMETERS,
         call=_call,
-        # serial:子 Agent 会写 workspace / 跑命令,有副作用,必须串行,不能和别的
-        # 写工具在同一回合并发争抢同一份文件。
-        concurrency="serial",
+        # 子 Agent 各自隔离 cwd/后台任务；共享 workspace 写入由文件路径锁保护。
+        is_concurrency_safe=lambda args: True,
     )
 
 

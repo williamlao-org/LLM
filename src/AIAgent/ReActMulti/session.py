@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import threading
 from typing import Any, Literal, TypeAlias
 from uuid import uuid4
 
@@ -46,6 +47,12 @@ class SessionState:
     step_count: int = 0
     max_steps: int = 25
     message_id_counter: int = 0
+    _cwd_lock: threading.RLock = field(
+        default_factory=threading.RLock, repr=False
+    )
+    _background_tasks_lock: threading.RLock = field(
+        default_factory=threading.RLock, repr=False
+    )
 
     @classmethod
     def create(
@@ -55,14 +62,30 @@ class SessionState:
             session_id=uuid4().hex[:6],
             status="running",
             user_goal=user_goal,
-            workspace_dir=workspace_dir,
-            cwd=workspace_dir,
+            workspace_dir=workspace_dir.resolve(),
+            cwd=workspace_dir.resolve(),
             turns=[],
             message_records=[],
             tool_executions={},
             background_tasks={},
             max_steps=max_steps,
         )
+
+    def get_cwd(self) -> Path:
+        with self._cwd_lock:
+            return self.cwd
+
+    def set_cwd(self, cwd: Path) -> None:
+        with self._cwd_lock:
+            self.cwd = cwd.resolve()
+
+    def register_background_task(self, task: "BackgroundTask") -> None:
+        with self._background_tasks_lock:
+            self.background_tasks[task.task_id] = task
+
+    def get_background_task(self, task_id: str) -> "BackgroundTask | None":
+        with self._background_tasks_lock:
+            return self.background_tasks.get(task_id)
 
     def _next_step(self) -> int:
         self.step_count += 1
@@ -286,4 +309,10 @@ class TurnRecord:
 
 @dataclass
 class BackgroundTask:
-    pass
+    task_id: str
+    process: Any
+    output_lines: list[str]
+    done: threading.Event
+    output_lock: threading.RLock = field(
+        default_factory=threading.RLock, repr=False
+    )

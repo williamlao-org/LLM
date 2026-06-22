@@ -92,7 +92,7 @@ web_search_tool = Tool(
         "required": ["query", "max_results"],
     },
     call=lambda args, runtime: web_search(**args),
-    concurrency="parallel",
+    is_concurrency_safe=lambda args: True,
 )
 
 http_request_tool = Tool(
@@ -123,6 +123,6 @@ http_request_tool = Tool(
     },
     call=lambda args, runtime: http_request(**args),
     check_permission=_ask_http_request,
-    # 即使是 POST/PUT,副作用也落在远端,不与本地 workspace 抢资源 → 可并发。
-    concurrency="parallel",
+    is_concurrency_safe=lambda args: str(args.get("method", "GET")).upper()
+    in {"GET", "HEAD"},
 )

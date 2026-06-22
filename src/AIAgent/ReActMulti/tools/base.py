@@ -4,10 +4,16 @@ from typing import Any, Callable, Literal
 
 from ..permission import PermissionCheckResult
 
-# 并发策略:parallel = 只读/无本地副作用,可丢线程池并发;
-# serial = 会改 workspace 或有副作用,必须串行执行。
-# 默认 serial:新工具不显式声明时按最保守处理,宁可慢不要竞态。
-Concurrency = Literal["parallel", "serial"]
+TimeoutOwner = Literal["executor", "tool"]
+
+
+class ToolCancelledError(RuntimeError):
+    """工具观察到取消信号后主动退出。"""
+
+
+def _not_concurrency_safe(args: dict[str, Any]) -> bool:
+    """新工具默认排他执行；必须显式声明才允许进入并发批。"""
+    return False
 
 
 @dataclass
@@ -26,6 +32,7 @@ class ToolRuntime:
     # 避免各工具自己猜 Path.cwd() 或维护重复状态。
     workspace_dir: Path | None = None
     cwd_provider: Callable[[], Path] | None = None
+    session_state: Any = None
 
     # 文本流式输出:例如 shell stdout。命名保持通用,不绑定 command 工具。
     emit_output: Callable[[str], None] | None = None
@@ -33,8 +40,17 @@ class ToolRuntime:
     # 结构化进度事件:未来可用于下载进度、批处理进度、后台任务状态等。
     emit_progress: Callable[[dict[str, Any]], None] | None = None
 
-    # 取消信号:未来用户中断/上层 abort 时,长任务工具可主动停止。
-    is_cancelled: Callable[[], bool] | None = None
+    # 每次调用独立的取消信号。工具里的长循环/阻塞分段应定期检查。
+    cancellation_check: Callable[[], bool] | None = None
+
+    def is_cancelled(self) -> bool:
+        return bool(self.cancellation_check and self.cancellation_check())
+
+    def raise_if_cancelled(self) -> None:
+        if self.is_cancelled():
+            raise ToolCancelledError(
+                f"{self.tool_name or 'tool'} cancelled"
+            )
 
 
 def _default_check_permission(
@@ -56,10 +72,12 @@ class Tool:
     check_permission: Callable[[dict[str, Any], ToolRuntime], PermissionCheckResult] = (
         _default_check_permission
     )
-    concurrency: Concurrency = "serial"
+    is_concurrency_safe: Callable[[dict[str, Any]], bool] = _not_concurrency_safe
+    # executor:统一 deadline + 协作取消；tool:工具自己定义超时语义(如 shell 转后台)。
+    timeout_owner: TimeoutOwner = "executor"
 
     def to_dict(self):
-        # concurrency 是系统调度用的内部元数据,不喂给模型(模型只管想调什么)。
+        # 并发与超时策略是系统调度元数据,不喂给模型。
         return {
             "name": self.name,
             "description": self.description,

@@ -1,5 +1,6 @@
 import json
 from collections.abc import Sequence
+from typing import Callable
 
 from openai.types.chat import ChatCompletionMessageParam
 
@@ -13,7 +14,6 @@ from .renderer import Renderer
 from .session import SessionState, UsageRecord
 from .protocol import TurnAbort, parse_turn
 from .tools.base import Tool
-from .tools.command_tools import get_cwd
 from .util import build_tool_results_message
 
 
@@ -29,6 +29,7 @@ class Agent:
         keep_recent_tool_results: int = 3,
         max_consecutive_invalid: int = 3,
         permission_resolver: PermissionResolver | None = None,
+        cancellation_check: Callable[[], bool] | None = None,
     ):
         self.llm = llm
         self.session_state = session_state
@@ -36,6 +37,7 @@ class Agent:
         # 权限裁决器可由装配层注入(承载规则/模式配置),并沿主→子 Agent 共用同一份;
         # 不传则 ToolExecutor 自建一个无 handler 的默认 resolver(ask 一律 fail-closed)。
         self._permission_resolver = permission_resolver
+        self._cancellation_check = cancellation_check
         # 连续 N 轮解析失败就止损:再喂回去也大概率是同样的废 JSON,
         # 与其烧光 max_steps,不如如实标 failed 退出。中间成功一次即清零。
         self.max_consecutive_invalid = max_consecutive_invalid
@@ -67,8 +69,8 @@ class Agent:
             tool_timeout=tool_timeout,
             on_command_output=renderer.on_command_output,
             permission_resolver=permission_resolver,
-            workspace_dir=session_state.workspace_dir,
-            cwd_provider=get_cwd,
+            session_state=session_state,
+            cancellation_check=cancellation_check,
         )
 
     @property
@@ -130,6 +132,9 @@ class Agent:
         consecutive_invalid = 0
 
         for _ in range(max_steps):
+            if self._cancellation_check and self._cancellation_check():
+                self.session_state.mark_failed()
+                return None
             self._compact_context_if_needed()
 
             # ----- 步骤 1：调用 LLM 推理 -----

@@ -1,7 +1,7 @@
 """工具调度执行器:把一轮里的若干 tool_calls 跑出结果。
 
-从 Agent 里独立出来,职责单一——查表、钳超时、按 concurrency 分流(只读批并发、
-写/命令批串行)、把异常/超时吞成 ToolResult 占位。它不认识 ReAct 主循环,也不认识
+从 Agent 里独立出来,职责单一——查表、钳超时、按原始顺序切并发安全批次、
+把异常/超时吞成 ToolResult 占位。它不认识 ReAct 主循环,也不认识
 整个 Renderer,只在构造时收一个 on_command_output 回调(execute_command 的流式输出
 要从工具内部的 reader 线程往外喷,这是唯一需要的渲染钩子)。
 
@@ -10,10 +10,9 @@
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, replace
-from math import ceil
 from pathlib import Path
+import threading
 from typing import Callable
 
 from .permission import (
@@ -22,7 +21,13 @@ from .permission import (
     PermissionResolver,
 )
 from .session import ToolExecutionTerminal
-from .tools.base import Concurrency, Tool, ToolCall, ToolResult, ToolRuntime
+from .tools.base import (
+    Tool,
+    ToolCall,
+    ToolCancelledError,
+    ToolResult,
+    ToolRuntime,
+)
 
 
 @dataclass(frozen=True)
@@ -43,22 +48,45 @@ class ToolExecutor:
         permission_resolver: PermissionResolver | None = None,
         workspace_dir: Path | None = None,
         cwd_provider: Callable[[], Path] | None = None,
+        session_state=None,
+        cancellation_check: Callable[[], bool] | None = None,
     ):
+        if tool_timeout <= 0:
+            raise ValueError("tool_timeout 必须 > 0")
         self.tool_registry = tool_registry
         self.tool_timeout = tool_timeout
         self.permission_resolver = permission_resolver or PermissionResolver(
             permission_policy or PermissionPolicy(),
             permission_approval_handler,
         )
-        self.workspace_dir = (workspace_dir or Path.cwd()).resolve()
-        self.cwd_provider = cwd_provider or (lambda: self.workspace_dir)
+        self.session_state = session_state
+        self.workspace_dir = (
+            workspace_dir
+            or getattr(session_state, "workspace_dir", None)
+            or Path.cwd()
+        ).resolve()
+        self.cwd_provider = (
+            cwd_provider
+            or (
+                session_state.get_cwd
+                if session_state is not None
+                else lambda: self.workspace_dir
+            )
+        )
+        self.cancellation_check = cancellation_check
         self.runtime = ToolRuntime(
             workspace_dir=self.workspace_dir,
             cwd_provider=self.cwd_provider,
+            session_state=session_state,
             emit_output=on_command_output,
         )
 
-    def _invoke_tool(self, tool_call: ToolCall) -> ToolResult:
+    def _invoke_tool(
+        self,
+        tool_call: ToolCall,
+        local_cancel: threading.Event,
+        on_call_start: Callable[[], None] | None = None,
+    ) -> ToolResult:
         """查找并执行【单个】工具，返回标准化 tool_result。"""
         tool = self.tool_registry.get(tool_call.name)
         if tool is None:
@@ -68,7 +96,14 @@ class ToolExecutor:
             self.runtime,
             tool_name=tool_call.name,
             tool_call_id=tool_call.id,
+            cancellation_check=lambda: local_cancel.is_set()
+            or bool(self.cancellation_check and self.cancellation_check()),
         )
+
+        try:
+            runtime.raise_if_cancelled()
+        except ToolCancelledError as e:
+            return ToolResult.fail(str(e))
 
         permission = self.permission_resolver.resolve(
             tool_call,
@@ -92,7 +127,11 @@ class ToolExecutor:
 
         # 浅拷贝再改:钳超时是执行期的局部需要,不能回写 tool_call.arguments
         # ——那个 dict 同一对象被 session 记账引用着,原地改会篡改"已记录的历史输入"。
-        arguments = dict(permission.updated_arguments or tool_call.arguments)
+        arguments = dict(
+            tool_call.arguments
+            if permission.updated_arguments is None
+            else permission.updated_arguments
+        )
 
         # 内层超时必须 ≤ 外层线程预算:模型可以给工具传很大的 timeout,
         # 不钳制的话外层先掐,工具内部的超时机制(如 execute_command 转后台)永远轮不到登场
@@ -100,7 +139,12 @@ class ToolExecutor:
             arguments["timeout"] = min(arguments["timeout"], self.tool_timeout)
 
         try:
+            runtime.raise_if_cancelled()
+            if on_call_start is not None:
+                on_call_start()
             tool_result = tool.call(arguments, runtime)
+        except ToolCancelledError as e:
+            tool_result = ToolResult.fail(str(e))
         except Exception as e:
             tool_result = ToolResult.fail(f"{type(e).__name__}: {e}")
 
@@ -112,10 +156,54 @@ class ToolExecutor:
         except Exception:
             return self.workspace_dir
 
-    def _concurrency_for(self, tool_call: ToolCall) -> Concurrency:
-        """查工具的并发策略;未知工具按最保守的 serial 处理(执行时本就会 fail)。"""
+    def _is_concurrency_safe(self, tool_call: ToolCall) -> bool:
+        """按本次参数判断能否并发；未知/判断异常一律按排他执行。"""
         tool = self.tool_registry.get(tool_call.name)
-        return tool.concurrency if tool is not None else "serial"
+        if tool is None:
+            return False
+        try:
+            return bool(tool.is_concurrency_safe(dict(tool_call.arguments)))
+        except Exception:
+            return False
+
+    def _run_one(self, idx: int, tool_call: ToolCall) -> tuple[int, ToolExecutionOutcome]:
+        tool = self.tool_registry.get(tool_call.name)
+        local_cancel = threading.Event()
+        timer: threading.Timer | None = None
+
+        def start_deadline() -> None:
+            nonlocal timer
+            timer = threading.Timer(self.tool_timeout, local_cancel.set)
+            timer.daemon = True
+            timer.start()
+
+        try:
+            result = self._invoke_tool(
+                tool_call,
+                local_cancel,
+                on_call_start=(
+                    start_deadline
+                    if tool is not None and tool.timeout_owner == "executor"
+                    else None
+                ),
+            )
+        finally:
+            if timer is not None:
+                timer.cancel()
+
+        if local_cancel.is_set():
+            result = ToolResult.fail(
+                f"timeout: 超过 {self.tool_timeout}s，工具已响应取消并退出"
+            )
+            status: ToolExecutionTerminal = "timeout"
+        else:
+            status = "succeeded" if result.ok else "failed"
+
+        return idx, ToolExecutionOutcome(
+            call=tool_call,
+            result=result,
+            status=status,
+        )
 
     def _run_concurrent_batch(
         self,
@@ -139,45 +227,35 @@ class ToolExecutor:
         if not indexed_calls:
             return out
 
-        call_by_idx = dict(indexed_calls)
-        budget = self.tool_timeout * ceil(len(indexed_calls) / max_workers)
-
-        pool = ThreadPoolExecutor(max_workers=max_workers)
-        fut_to_idx = {
-            pool.submit(self._invoke_tool, tc): idx for idx, tc in indexed_calls
-        }
-
-        try:
-            # 谁先跑完谁先渲染(实时),写回按下标(保序)
-            for fut in as_completed(fut_to_idx, timeout=budget):
-                idx = fut_to_idx[fut]
-                result = fut.result()  # _invoke_tool 不抛异常,恒拿到 ToolResult
+        # context manager 会等待已经启动的调用真正退出。Python 线程不能安全强杀，
+        # 所以 deadline 通过 ToolRuntime 的取消信号协作完成，绝不遗弃后台线程。
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [
+                pool.submit(self._run_one, idx, tc) for idx, tc in indexed_calls
+            ]
+            for fut in as_completed(futures):
+                idx, outcome = fut.result()
                 if on_result:
-                    on_result(result)
-                out[idx] = ToolExecutionOutcome(
-                    call=call_by_idx[idx],
-                    result=result,
-                    status="succeeded" if result.ok else "failed",
-                )
-
-        except (TimeoutError, FuturesTimeoutError):
-            for idx, tc in indexed_calls:
-                if idx not in out:
-                    result = ToolResult.fail(
-                        f"timeout: 超过 {budget}s 未完成(工具可能仍在后台运行)"
-                    )
-                    if on_result:
-                        on_result(result)
-                    out[idx] = ToolExecutionOutcome(
-                        call=tc,
-                        result=result,
-                        status="timeout",
-                    )
-
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
+                    on_result(outcome.result)
+                out[idx] = outcome
 
         return out
+
+    def _partition_calls(
+        self, tool_calls: list[ToolCall]
+    ) -> list[list[tuple[int, ToolCall]]]:
+        """保持原始顺序：连续安全调用合并成并发批，不安全调用各自单独成批。"""
+        batches: list[list[tuple[int, ToolCall]]] = []
+        previous_batch_is_safe = False
+        for indexed in enumerate(tool_calls):
+            _, tool_call = indexed
+            safe = self._is_concurrency_safe(tool_call)
+            if safe and batches and previous_batch_is_safe:
+                batches[-1].append(indexed)
+            else:
+                batches.append([indexed])
+            previous_batch_is_safe = safe
+        return batches
 
     def execute(
         self,
@@ -186,12 +264,11 @@ class ToolExecutor:
         on_result: Callable[[ToolResult], None] | None = None,
         max_workers: int = 8,
     ) -> list[ToolExecutionOutcome]:
-        """按工具 concurrency 分流执行,返回 outcome 列表,顺序恒等于输入。
+        """保持调用顺序切批执行,返回顺序恒等于输入。
 
-        只读批(parallel)整批丢进线程池并发;写/命令批(serial)逐个执行。
-        两阶段不重叠——读批全跑完才跑写批——避免读写争抢同一资源(如同一文件)。
-        串行批也逐个走 _run_concurrent_batch(单元素),因此超时/状态/保序逻辑
-        与并发批完全一致。
+        连续 concurrency-safe 调用并发；每个不安全调用独占一个批次。
+        因此 `[read, read, write, read]` 是 `[read+read] → [write] → [read]`，
+        不会把后面的 read 提前到 write 前面。
 
         on_call 先按输入顺序全报一遍("这一轮要调这些工具"),再开跑。
         """
@@ -199,29 +276,14 @@ class ToolExecutor:
             for tool_call in tool_calls:
                 on_call(tool_call)
 
-        parallel = [
-            (i, tc)
-            for i, tc in enumerate(tool_calls)
-            if self._concurrency_for(tc) == "parallel"
-        ]
-        serial = [
-            (i, tc)
-            for i, tc in enumerate(tool_calls)
-            if self._concurrency_for(tc) == "serial"
-        ]
-
         slots: list[ToolExecutionOutcome | None] = [None] * len(tool_calls)
 
-        # 阶段一:只读批并发
-        for idx, slot in self._run_concurrent_batch(
-            parallel, on_result, max_workers
-        ).items():
-            slots[idx] = slot
+        if max_workers < 1:
+            raise ValueError("max_workers 必须 >= 1")
 
-        # 阶段二:写/命令批串行——逐个丢单元素 pool,既保证串行又复用超时/状态逻辑
-        for indexed in serial:
+        for batch in self._partition_calls(tool_calls):
             for idx, slot in self._run_concurrent_batch(
-                [indexed], on_result, max_workers
+                batch, on_result, min(max_workers, len(batch))
             ).items():
                 slots[idx] = slot
 

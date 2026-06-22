@@ -6,6 +6,64 @@ from ..permission import PermissionCheckResult
 from .base import ToolRuntime
 
 
+_READ_ONLY_COMMANDS = {
+    "cat",
+    "cut",
+    "diff",
+    "du",
+    "echo",
+    "grep",
+    "head",
+    "ls",
+    "pwd",
+    "rg",
+    "stat",
+    "tail",
+    "tree",
+    "uname",
+    "uniq",
+    "wc",
+    "which",
+}
+_READ_ONLY_GIT_SUBCOMMANDS = {
+    "diff",
+    "log",
+    "show",
+    "status",
+    "rev-parse",
+    "ls-files",
+}
+
+
+def is_execute_command_concurrency_safe(args: dict) -> bool:
+    """保守识别只读 shell；解析不清、会改 cwd 或可能写入时一律排他。"""
+    command = str(args.get("command", "")).strip()
+    if not command or _has_output_redirection(command):
+        return False
+    if "$(" in command or "`" in command or "<(" in command or ">(" in command:
+        return False
+    if re.search(r"(^|[;&|]\s*)cd(?:\s|$)", command):
+        return False
+
+    tokens = _shell_tokens(command)
+    names = _command_names(tokens)
+    if not names:
+        return False
+    if "git" in names:
+        try:
+            git_index = next(
+                i for i, token in enumerate(tokens) if Path(token).name == "git"
+            )
+            subcommand = tokens[git_index + 1]
+        except (StopIteration, IndexError):
+            return False
+        if subcommand not in _READ_ONLY_GIT_SUBCOMMANDS:
+            return False
+        names.remove("git")
+
+    return names <= _READ_ONLY_COMMANDS
+
+
 def check_execute_command_permission(
     args: dict, runtime: ToolRuntime
 ) -> PermissionCheckResult:

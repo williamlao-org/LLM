@@ -1,61 +1,54 @@
-import os
-import queue
 import shlex
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
+from typing import Any
 
-from .base import Tool, ToolResult, ToolRuntime
-from .command_permissions import check_execute_command_permission
+from .base import Tool, ToolCancelledError, ToolResult, ToolRuntime
+from .command_permissions import (
+    check_execute_command_permission,
+    is_execute_command_concurrency_safe,
+)
 
-WORKSPACE_DIR = Path(__file__).resolve().parent.parent / "workspace"
-WORKSPACE_DIR.mkdir(exist_ok=True)
-
-# ── session 级别 cwd ──────────────────────────────────────────────────────────
-
-_cwd_lock = threading.Lock()
-_cwd: Path = WORKSPACE_DIR
-
-
-def get_cwd() -> Path:
-    with _cwd_lock:
-        return _cwd
+def _session(runtime: ToolRuntime | None) -> Any:
+    session = runtime.session_state if runtime is not None else None
+    if session is None or not hasattr(session, "get_cwd"):
+        raise RuntimeError("command tool requires a SessionState runtime")
+    return session
 
 
-def _set_cwd(new_cwd: Path) -> None:
-    with _cwd_lock:
-        global _cwd
-        _cwd = new_cwd
+def _make_background_task(
+    task_id: str,
+    proc: subprocess.Popen,
+    output_lines: list[str],
+    done_event: threading.Event,
+    output_lock: threading.RLock,
+):
+    # 延迟导入避免 session -> tools.base -> tools.__init__ -> command_tools 的环。
+    from ..session import BackgroundTask
+
+    return BackgroundTask(task_id, proc, output_lines, done_event, output_lock)
 
 
-# ── 后台任务注册表 ────────────────────────────────────────────────────────────
-
-_tasks: dict[str, dict] = {}
-_tasks_lock = threading.Lock()
-
-
-def _register_task(
-    task_id: str, proc: subprocess.Popen, lines: list[str], done: threading.Event
-) -> None:
-    with _tasks_lock:
-        _tasks[task_id] = {"proc": proc, "lines": lines, "done": done}
-
-
-def get_task_output(task_id: str) -> ToolResult:
+def get_task_output(task_id: str, runtime: ToolRuntime | None = None) -> ToolResult:
     """查询后台任务的当前输出和状态。"""
-    with _tasks_lock:
-        task = _tasks.get(task_id)
+    try:
+        task = _session(runtime).get_background_task(task_id)
+    except Exception as e:
+        return ToolResult.fail(str(e))
     if task is None:
         return ToolResult.fail(f"Unknown task_id: {task_id}")
-    done = task["done"].is_set()
-    output = "".join(task["lines"])
+    done = task.done.is_set()
+    with task.output_lock:
+        output = "".join(task.output_lines)
     return ToolResult.success(
         {
             "task_id": task_id,
             "done": done,
-            "returncode": task["proc"].returncode if done else None,
+            "returncode": task.process.returncode if done else None,
             "output": output[-8000:],
         }
     )
@@ -82,10 +75,14 @@ def execute_command(
     - run_in_background：立即后台运行，返回 task_id。
     """
     try:
-        cwd = get_cwd()
+        session = _session(runtime)
+        cwd = session.get_cwd()
 
         # 注入 cwd 追踪：用临时文件，和 Claude Code 的 claude-{id}-cwd 一致
-        cwd_file = Path(tempfile.mktemp(prefix="react-cwd-"))
+        tmp = tempfile.NamedTemporaryFile(prefix="react-cwd-", delete=False)
+        cwd_file = Path(tmp.name)
+        tmp.close()
+        cwd_file.unlink(missing_ok=True)
         # 末尾追加 `&& pwd -P > tmpfile`，无论命令成败都不影响返回码
         # （pwd -P 只在主命令成功时才写，和 Claude Code 的 &&  行为一致）
         injected = (
@@ -108,24 +105,34 @@ def execute_command(
         return ToolResult.fail(f"{type(e).__name__}: {e}")
 
     output_lines: list[str] = []
+    output_lock = threading.RLock()
     done_event = threading.Event()
+    cwd_result: list[Path] = []
 
     def _reader():
         assert proc.stdout is not None
         for line in proc.stdout:
-            output_lines.append(line)
+            with output_lock:
+                output_lines.append(line)
             if runtime and runtime.emit_output:
                 runtime.emit_output(line)
         proc.wait()
-        # 先更新 cwd，再 set done_event，保证调用方 wait() 返回时 cwd 已就绪
-        _read_cwd_file(cwd_file)
+        # reader 只采集命令结束时的 cwd，不负责提交。只有前台调用路径确认命令
+        # 没有转后台后才会更新 session，彻底消除 timeout 临界点的提交竞态。
+        new_cwd = _consume_cwd_file(cwd_file)
+        if new_cwd is not None:
+            cwd_result.append(new_cwd)
         done_event.set()
 
     threading.Thread(target=_reader, daemon=True).start()
 
     if run_in_background:
         task_id = f"task_{uuid.uuid4().hex[:8]}"
-        _register_task(task_id, proc, output_lines, done_event)
+        session.register_background_task(
+            _make_background_task(
+                task_id, proc, output_lines, done_event, output_lock
+            )
+        )
         return ToolResult.success(
             {
                 "task_id": task_id,
@@ -133,22 +140,46 @@ def execute_command(
             }
         )
 
-    finished = done_event.wait(timeout=timeout)
+    deadline = time.monotonic() + timeout
+    finished = False
+    while not finished:
+        if runtime and runtime.is_cancelled():
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            done_event.wait(timeout=2)
+            raise ToolCancelledError("execute_command cancelled")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        finished = done_event.wait(timeout=min(0.1, remaining))
 
     if not finished:
         # 超时：不 kill，转后台
         task_id = f"task_{uuid.uuid4().hex[:8]}"
-        _register_task(task_id, proc, output_lines, done_event)
+        session.register_background_task(
+            _make_background_task(
+                task_id, proc, output_lines, done_event, output_lock
+            )
+        )
+        with output_lock:
+            output_so_far = "".join(output_lines)[-MAX_OUTPUT_CHARS:]
         return ToolResult.success(
             {
                 "task_id": task_id,
                 "timed_out": True,
                 "message": f"命令超过 {timeout}s 未完成，已转为后台任务 {task_id}。",
-                "output_so_far": "".join(output_lines)[-MAX_OUTPUT_CHARS:],
+                "output_so_far": output_so_far,
             }
         )
 
-    output = "".join(output_lines)
+    if cwd_result:
+        session.set_cwd(cwd_result[0])
+
+    with output_lock:
+        output = "".join(output_lines)
     if len(output) > MAX_OUTPUT_CHARS:
         output = f"[...截断，仅显示末尾]\n{output[-MAX_OUTPUT_CHARS:]}"
 
@@ -160,18 +191,17 @@ def execute_command(
     return ToolResult.fail(err=f"命令以退出码 {returncode} 结束", data=data)
 
 
-def _read_cwd_file(cwd_file: Path) -> None:
-    """读取 pwd -P 写入的临时文件，更新 session cwd，然后删除文件。
+def _consume_cwd_file(cwd_file: Path) -> Path | None:
+    """读取并删除 pwd -P 写入的临时文件，返回可用 cwd 候选值。
 
     和 Claude Code Shell.ts 里的 readFileSync + unlinkSync 逻辑对应。
-    只在文件存在时（即主命令成功退出）才更新，失败命令不改变 cwd。
+    是否提交给 session 由前台调用路径决定；后台 reader 永远不能直接改 cwd。
     """
     try:
         new_cwd = Path(cwd_file.read_text().strip())
-        if new_cwd.is_dir():
-            _set_cwd(new_cwd)
+        return new_cwd if new_cwd.is_dir() else None
     except Exception:
-        pass  # 文件不存在（命令失败）或路径非法，静默忽略
+        return None  # 文件不存在（命令失败）或路径非法，静默忽略
     finally:
         try:
             cwd_file.unlink()
@@ -211,8 +241,9 @@ execute_command_tool = Tool(
     },
     call=lambda args, runtime: execute_command(**args, runtime=runtime),
     check_permission=check_execute_command_permission,
-    # 会改 session cwd、跑任意 shell,副作用最大 → 必须串行。
-    concurrency="serial",
+    is_concurrency_safe=is_execute_command_concurrency_safe,
+    # shell 自己负责前台 timeout → 后台 task 的语义。
+    timeout_owner="tool",
 )
 
 get_task_output_tool = Tool(
@@ -228,6 +259,6 @@ get_task_output_tool = Tool(
         },
         "required": ["task_id"],
     },
-    call=lambda args, runtime: get_task_output(**args),
-    concurrency="parallel",
+    call=lambda args, runtime: get_task_output(**args, runtime=runtime),
+    is_concurrency_safe=lambda args: True,
 )

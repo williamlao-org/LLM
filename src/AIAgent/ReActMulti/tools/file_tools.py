@@ -1,24 +1,39 @@
 # 文件操作工具链
 from pathlib import Path
+import threading
 from ..permission import PermissionCheckResult
-from .base import Tool, ToolResult
-
-WORKSPACE_DIR = Path(__file__).resolve().parent.parent / "workspace"
-MAX_READ_CHARS = 1_000_000  # 单次最多读 100 万字符,够用又不撑爆内存
+from .base import Tool, ToolResult, ToolRuntime
 
 MAX_READ_CHARS = 1_000_000  # 单次最多读 100 万字符,够用又不撑爆内存
 
+_path_locks_guard = threading.Lock()
+_path_locks: dict[Path, threading.RLock] = {}
 
-def _safe_path(path: str) -> Path:
-    safe_path = (WORKSPACE_DIR / path).resolve()
-    if not safe_path.is_relative_to(WORKSPACE_DIR):
+
+def _workspace(runtime: ToolRuntime) -> Path:
+    if runtime.workspace_dir is None:
+        raise RuntimeError("file tool requires runtime.workspace_dir")
+    return runtime.workspace_dir.resolve()
+
+
+def _safe_path(path: str, runtime: ToolRuntime) -> Path:
+    workspace = _workspace(runtime)
+    safe_path = (workspace / path).resolve()
+    if not safe_path.is_relative_to(workspace):
         raise ValueError("Unsafe path")
     return safe_path
 
 
-def list_files(directory: str = "."):
+def _path_lock(path: Path) -> threading.RLock:
+    with _path_locks_guard:
+        return _path_locks.setdefault(path, threading.RLock())
+
+
+def list_files(directory: str = ".", runtime: ToolRuntime | None = None):
     try:
-        safe_directory = _safe_path(directory)
+        assert runtime is not None
+        runtime.raise_if_cancelled()
+        safe_directory = _safe_path(directory, runtime)
         files = [entry.name for entry in safe_directory.iterdir() if entry.is_file()]
         dirs = [entry.name for entry in safe_directory.iterdir() if entry.is_dir()]
         return ToolResult.success({"files": files, "dirs": dirs})
@@ -26,9 +41,13 @@ def list_files(directory: str = "."):
         return ToolResult.fail(str(e), data={"files": [], "dirs": []})
 
 
-def read_file(file: str, max_chars: int = 8000):
+def read_file(
+    file: str, max_chars: int = 8000, runtime: ToolRuntime | None = None
+):
     try:
-        safe_path = _safe_path(file)
+        assert runtime is not None
+        runtime.raise_if_cancelled()
+        safe_path = _safe_path(file, runtime)
 
         if not safe_path.is_file():
             return ToolResult.fail("Not a file", data={"content": ""})
@@ -53,23 +72,32 @@ def read_file(file: str, max_chars: int = 8000):
         return ToolResult.fail(str(e), data={"content": ""})
 
 
-def write_file(file: str, content: str, overwrite: bool = True):
+def write_file(
+    file: str,
+    content: str,
+    overwrite: bool = True,
+    runtime: ToolRuntime | None = None,
+):
     try:
-        safe_path = _safe_path(file)
+        assert runtime is not None
+        runtime.raise_if_cancelled()
+        safe_path = _safe_path(file, runtime)
 
-        if safe_path.exists() and safe_path.is_dir():
-            return ToolResult.fail("Path is a directory")
+        with _path_lock(safe_path):
+            runtime.raise_if_cancelled()
+            if safe_path.exists() and safe_path.is_dir():
+                return ToolResult.fail("Path is a directory")
 
-        if safe_path.exists() and not overwrite:
-            return ToolResult.fail("File already exists")
+            if safe_path.exists() and not overwrite:
+                return ToolResult.fail("File already exists")
 
-        safe_path.parent.mkdir(parents=True, exist_ok=True)
-        safe_path.write_text(content, encoding="utf-8")
+            safe_path.parent.mkdir(parents=True, exist_ok=True)
+            safe_path.write_text(content, encoding="utf-8")
 
         return ToolResult.success(
             {
                 "message": "File written",
-                "file": str(safe_path.relative_to(WORKSPACE_DIR)),
+                "file": str(safe_path.relative_to(_workspace(runtime))),
                 "chars": len(content),
             }
         )
@@ -77,25 +105,35 @@ def write_file(file: str, content: str, overwrite: bool = True):
         return ToolResult.fail(str(e))
 
 
-def edit_file(file: str, old_text: str, new_text: str):
+def edit_file(
+    file: str,
+    old_text: str,
+    new_text: str,
+    runtime: ToolRuntime | None = None,
+):
     try:
-        safe_path = _safe_path(file)
+        assert runtime is not None
+        runtime.raise_if_cancelled()
+        safe_path = _safe_path(file, runtime)
 
-        if not safe_path.is_file():
-            return ToolResult.fail("Not a file")
+        with _path_lock(safe_path):
+            runtime.raise_if_cancelled()
+            if not safe_path.is_file():
+                return ToolResult.fail("Not a file")
 
-        content = safe_path.read_text(encoding="utf-8")
+            # 必须在锁内重读，避免等待锁期间文件内容已被其他 Agent 改变。
+            content = safe_path.read_text(encoding="utf-8")
 
-        count = content.count(old_text)
-        if count == 0:
-            return ToolResult.fail("old_text not found")
-        if count > 1:
-            return ToolResult.fail(
-                f"old_text found {count} times, replacement is ambiguous"
-            )
+            count = content.count(old_text)
+            if count == 0:
+                return ToolResult.fail("old_text not found")
+            if count > 1:
+                return ToolResult.fail(
+                    f"old_text found {count} times, replacement is ambiguous"
+                )
 
-        updated = content.replace(old_text, new_text, 1)
-        safe_path.write_text(updated, encoding="utf-8")
+            updated = content.replace(old_text, new_text, 1)
+            safe_path.write_text(updated, encoding="utf-8")
 
         return ToolResult.success({"message": "File updated"})
     except Exception as e:
@@ -135,8 +173,8 @@ list_files_tool = Tool(
         },
         "required": ["directory"],
     },
-    call=lambda args, runtime: list_files(**args),
-    concurrency="parallel",
+    call=lambda args, runtime: list_files(**args, runtime=runtime),
+    is_concurrency_safe=lambda args: True,
 )
 
 read_file_tool = Tool(
@@ -152,8 +190,8 @@ read_file_tool = Tool(
         },
         "required": ["file"],
     },
-    call=lambda args, runtime: read_file(**args),
-    concurrency="parallel",
+    call=lambda args, runtime: read_file(**args, runtime=runtime),
+    is_concurrency_safe=lambda args: True,
 )
 
 write_file_tool = Tool(
@@ -178,9 +216,8 @@ write_file_tool = Tool(
         },
         "required": ["file", "content"],
     },
-    call=lambda args, runtime: write_file(**args),
+    call=lambda args, runtime: write_file(**args, runtime=runtime),
     check_permission=_ask_file_write,
-    concurrency="serial",
 )
 
 
@@ -205,7 +242,6 @@ edit_file_tool = Tool(
         },
         "required": ["file", "old_text", "new_text"],
     },
-    call=lambda args, runtime: edit_file(**args),
+    call=lambda args, runtime: edit_file(**args, runtime=runtime),
     check_permission=_ask_file_edit,
-    concurrency="serial",
 )

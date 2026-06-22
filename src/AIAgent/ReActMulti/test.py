@@ -8,6 +8,7 @@ LLMClient 用假参数构造(不发起任何网络请求),整套测试离线可�
 """
 
 import json
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -80,19 +81,20 @@ def test_agent_does_not_duplicate_system_prompt_for_existing_session():
 
 
 def test_parallel_timeout_fills_fail():
-    """超时的调用必须以 fail 占位留在结果里,不能蒸发,也不能炸穿。"""
+    """协作式取消后必须以 timeout 占位，不能遗弃仍运行的线程。"""
 
-    def fast():
+    def fast(args, runtime):
         return ToolResult.success("fast done")
 
-    def slow():
-        time.sleep(3)
-        return ToolResult.success("slow done")
+    def slow(args, runtime):
+        while True:
+            runtime.raise_if_cancelled()
+            time.sleep(0.01)
 
     agent = _make_agent(
         [
-            Tool("fast", "", {}, lambda args, runtime: fast(), concurrency="parallel"),
-            Tool("slow", "", {}, lambda args, runtime: slow(), concurrency="parallel"),
+            Tool("fast", "", {}, fast, is_concurrency_safe=lambda args: True),
+            Tool("slow", "", {}, slow, is_concurrency_safe=lambda args: True),
         ],
         tool_timeout=0.5,
     )
@@ -108,6 +110,78 @@ def test_parallel_timeout_fills_fail():
     assert not outcomes[1].result.ok and "timeout" in outcomes[1].result.err
     assert outcomes[1].status == "timeout"
     assert elapsed < 2, f"应在预算 0.5s 附近返回,实际等了 {elapsed:.1f}s"
+
+
+def test_mixed_calls_preserve_original_batch_order():
+    """后面的安全调用不能越过前面的排他调用。"""
+    log: list[str] = []
+    lock = threading.Lock()
+
+    def make_tool(name: str, safe: bool):
+        def call(args, runtime):
+            with lock:
+                log.append(f"start:{name}")
+            time.sleep(0.02)
+            with lock:
+                log.append(f"end:{name}")
+            return ToolResult.success(name)
+
+        return Tool(
+            name,
+            "",
+            {},
+            call,
+            is_concurrency_safe=lambda args: safe,
+        )
+
+    agent = _make_agent(
+        [
+            make_tool("write", False),
+            make_tool("read1", True),
+            make_tool("read2", True),
+        ],
+        tool_timeout=1,
+    )
+    agent.executor.execute([
+        ToolCall("write", {}, "c1"),
+        ToolCall("read1", {}, "c2"),
+        ToolCall("read2", {}, "c3"),
+    ])
+
+    assert log[0:2] == ["start:write", "end:write"]
+    assert set(log[2:4]) == {"start:read1", "start:read2"}
+
+
+def test_serial_timeout_exits_before_next_tool_starts():
+    """排他工具收到 deadline 后必须先退出，下一项才能跨过批次边界。"""
+    log: list[str] = []
+
+    def slow(args, runtime):
+        log.append("slow-start")
+        while not runtime.is_cancelled():
+            time.sleep(0.01)
+        log.append("slow-exit")
+        runtime.raise_if_cancelled()
+
+    def next_tool(args, runtime):
+        log.append("next-start")
+        return ToolResult.success()
+
+    agent = _make_agent(
+        [
+            Tool("slow", "", {}, slow),
+            Tool("next", "", {}, next_tool),
+        ],
+        tool_timeout=0.1,
+    )
+    outcomes = agent.executor.execute([
+        ToolCall("slow", {}, "c1"),
+        ToolCall("next", {}, "c2"),
+    ])
+
+    assert log == ["slow-start", "slow-exit", "next-start"]
+    assert outcomes[0].status == "timeout"
+    assert outcomes[1].status == "succeeded"
 
 
 def test_inner_timeout_clamped_to_budget():
@@ -737,6 +811,8 @@ def test_running_total_append_message_increments():
 if __name__ == "__main__":
     test_agent_does_not_duplicate_system_prompt_for_existing_session()
     test_parallel_timeout_fills_fail()
+    test_mixed_calls_preserve_original_batch_order()
+    test_serial_timeout_exits_before_next_tool_starts()
     test_inner_timeout_clamped_to_budget()
     test_tool_runtime_is_separate_from_model_arguments()
     test_tool_exception_becomes_fail()
