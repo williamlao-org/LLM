@@ -27,6 +27,7 @@ from .permission import (
 from .renderer import ConsoleRenderer
 from .session import SessionState
 from .subagent import build_agent_tools
+from .tools.mcp_client import McpManager, load_mcp_config
 
 
 logger = get_logger(__name__)
@@ -56,10 +57,17 @@ if __name__ == "__main__":
         "子任务 A：计算 1 到 100 的整数之和，并把结果写入 sum_a.txt。\n"
         "子任务 B：用 web_search 查『2024 巴黎奥运会在哪个城市举办』，把答案写入 city_b.txt。"
     )
+    workspace_dir = Path(__file__).resolve().parent / "workspace"
     session_state = SessionState.create(
         user_goal=prompt,
-        workspace_dir=Path(__file__).resolve().parent / "workspace",
+        workspace_dir=workspace_dir,
     )
+
+    # MCP 接入:从 workspace 下的 .mcp.json 发现外部 stdio server,连接并把它们的工具
+    # 翻译成本系统的 Tool。session 由 mcp_manager 持有,整段运行期保持存活,finally 关闭。
+    # 没配 .mcp.json 时 configs 为空,start() 直接返回 [],对其余流程完全无感。
+    mcp_manager = McpManager(load_mcp_config(workspace_dir / ".mcp.json"))
+    mcp_tools = mcp_manager.start()
 
     # 权限裁决:加载持久化配置(模式 + allow/deny 规则),按"要不要人"两种装配。
     #
@@ -92,7 +100,7 @@ if __name__ == "__main__":
     # 它能委派出 depth=1 的子 Agent;到 max_depth 那层不再带 spawn,递归到底。
     tools = build_agent_tools(
         llm_client,
-        base_tools,
+        base_tools + mcp_tools,
         depth=0,
         max_depth=2,
         permission_resolver=permission_resolver,
@@ -106,8 +114,12 @@ if __name__ == "__main__":
         permission_resolver=permission_resolver,
     )
 
-    agent.run(
-        # "执行 python 代码 print(1/0)，并且用 web_search 搜索 2024 年奥运会在哪举办，再对 ifconfig.me/ip 发起 http 请求拿到公网 IP。执行命令查看当前主机信息"
-        prompt
-        # '写一个坦克大战游戏项目，有完整的开发流程'
-    )
+    try:
+        agent.run(
+            # "执行 python 代码 print(1/0)，并且用 web_search 搜索 2024 年奥运会在哪举办，再对 ifconfig.me/ip 发起 http 请求拿到公网 IP。执行命令查看当前主机信息"
+            prompt
+            # '写一个坦克大战游戏项目，有完整的开发流程'
+        )
+    finally:
+        # 关闭 MCP session / stdio 子进程,避免残留进程。
+        mcp_manager.shutdown()
