@@ -33,13 +33,15 @@ server = FastMCP(
 #   3. 收到 tools/call 时，自动匹配 name → 调用对应函数
 #   4. 把返回值包装成 {"content": [{"type": "text", "text": "..."}]}
 @server.tool(description="两个数相加")
-def add(a: float, b: float) -> str:
+def add(a: float, b: float ) -> str:
     """计算 a + b 的结果。
 
     Args:
         a: 第一个数
         b: 第二个数
     """
+    if b is None:
+        return str(a)
     return str(a + b)
 
 
