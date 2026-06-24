@@ -5,8 +5,9 @@
 所以接入 = 多产出几个 `Tool` 对象。MCP 的 inputSchema 与 Tool.parameters 同为
 JSON Schema,映射 1:1。
 
-本版范围(刻意收窄):只做 client、仅 stdio transport、配置走 .mcp.json,只接 tools
+本版范围(刻意收窄):只做 client、配置走 .mcp.json,只接 tools
 (不接 resources/prompts,不做动态 list_changed,不做 server 方向)。
+transport 支持三种(对标 Claude Code):stdio(子进程)、sse、http(streamable HTTP)。
 
 —— async↔sync 桥(本模块的核心机关)——
 官方 mcp SDK 是 asyncio 原生,而本系统的 ToolExecutor 是同步 + 线程池,tool.call 必须
@@ -38,7 +39,9 @@ from pathlib import Path
 from typing import Any
 
 from mcp import ClientSession, StdioServerParameters
+from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamablehttp_client
 
 from ..logger import get_logger
 from ..permission import PermissionCheckResult
@@ -49,19 +52,33 @@ logger = get_logger(__name__)
 
 @dataclass
 class McpServerConfig:
-    """一个 stdio MCP server 的启动参数(对标 .mcp.json 里 mcpServers 的一条)。"""
+    """一个 MCP server 的接入参数(对标 .mcp.json 里 mcpServers 的一条)。
+
+    transport 决定用到哪些字段:
+      - "stdio":command(必填)/ args / env —— 起子进程。
+      - "sse" / "http":url(必填)/ headers —— 连远端 HTTP 端点。
+    """
 
     name: str
-    command: str
+    transport: str = "stdio"
+    # stdio 用:
+    command: str | None = None
     args: list[str] = field(default_factory=list)
     env: dict[str, str] | None = None
+    # sse / http 用:
+    url: str | None = None
+    headers: dict[str, str] | None = None
 
 
 def load_mcp_config(path: Path) -> list[McpServerConfig]:
-    """读 .mcp.json,解析出所有【stdio】server 配置。
+    """读 .mcp.json,解析出所有 server 配置(stdio / sse / http 三种 transport)。
 
-    格式对标 Claude Code:{"mcpServers": {"<name>": {"command", "args", "env"}}}。
-    非 stdio 形态(带 url / type=sse|http|ws)本版不支持,跳过并 warn。
+    格式对标 Claude Code:{"mcpServers": {"<name>": {...}}},条目里:
+      - stdio:{"command", "args"?, "env"?}(或显式 "type": "stdio")。
+      - sse  :{"type": "sse",  "url", "headers"?}。
+      - http :{"type": "http", "url", "headers"?}("streamable-http" 同义)。
+    transport 优先看 type;缺省时由字段推断(有 command → stdio,有 url → http)。
+    缺关键字段(stdio 无 command / 远端无 url)→ 跳过并 warn。
     文件不存在 → 返回空列表(没配 MCP 是正常情况,不报错)。
     """
     if not path.exists():
@@ -82,19 +99,47 @@ def load_mcp_config(path: Path) -> list[McpServerConfig]:
         if not isinstance(entry, dict):
             logger.warning("跳过 MCP server %r:配置不是对象", name)
             continue
-        command = entry.get("command")
-        if not command:
-            # 没有 command 多半是 url 形态(sse/http),本版只支持 stdio。
-            logger.warning("跳过 MCP server %r:仅支持 stdio(需要 command 字段)", name)
-            continue
-        configs.append(
-            McpServerConfig(
-                name=name,
-                command=command,
-                args=list(entry.get("args") or []),
-                env=entry.get("env"),
+
+        # transport:显式 type 优先(streamable-http 归一为 http),否则按字段推断。
+        transport = entry.get("type")
+        if transport == "streamable-http":
+            transport = "http"
+        if transport is None:
+            transport = "stdio" if entry.get("command") else "http" if entry.get("url") else None
+
+        if transport == "stdio":
+            command = entry.get("command")
+            if not command:
+                logger.warning("跳过 MCP server %r:stdio 需要 command 字段", name)
+                continue
+            configs.append(
+                McpServerConfig(
+                    name=name,
+                    transport="stdio",
+                    command=command,
+                    args=list(entry.get("args") or []),
+                    env=entry.get("env"),
+                )
             )
-        )
+        elif transport in ("sse", "http"):
+            url = entry.get("url")
+            if not url:
+                logger.warning("跳过 MCP server %r:%s 需要 url 字段", name, transport)
+                continue
+            configs.append(
+                McpServerConfig(
+                    name=name,
+                    transport=transport,
+                    url=url,
+                    headers=entry.get("headers"),
+                )
+            )
+        else:
+            logger.warning(
+                "跳过 MCP server %r:无法识别 transport(type=%r,且缺 command/url)",
+                name,
+                entry.get("type"),
+            )
     return configs
 
 
@@ -186,9 +231,28 @@ class McpManager:
     async def _connect_one(
         self, stack: AsyncExitStack, cfg: McpServerConfig
     ) -> ClientSession:
-        params = StdioServerParameters(command=cfg.command, args=cfg.args, env=cfg.env)
-        # 子进程与 session 的生命周期挂在 stack 上,_serve 退出时一次性按相反顺序拆掉。
-        read, write = await stack.enter_async_context(stdio_client(params))
+        # 按 transport 建立 read/write 流;子进程/连接的生命周期挂在 stack 上,
+        # _serve 退出时一次性按相反顺序拆掉。三种 transport 之后的 session 处理完全一致。
+        if cfg.transport == "stdio":
+            assert cfg.command is not None  # load_mcp_config 已保证 stdio 必有 command
+            params = StdioServerParameters(
+                command=cfg.command, args=cfg.args, env=cfg.env
+            )
+            read, write = await stack.enter_async_context(stdio_client(params))
+        elif cfg.transport == "sse":
+            assert cfg.url is not None  # 远端 transport 必有 url
+            read, write = await stack.enter_async_context(
+                sse_client(url=cfg.url, headers=cfg.headers)
+            )
+        elif cfg.transport == "http":
+            assert cfg.url is not None
+            # streamable http 产出 3 元组,第三个是 get_session_id,本系统用不到。
+            read, write, _ = await stack.enter_async_context(
+                streamablehttp_client(url=cfg.url, headers=cfg.headers)
+            )
+        else:
+            raise ValueError(f"未知 transport: {cfg.transport!r}")
+
         session = await stack.enter_async_context(ClientSession(read, write))
         await session.initialize()
         return session

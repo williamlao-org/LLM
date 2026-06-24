@@ -14,7 +14,9 @@ from dotenv import load_dotenv
 
 from .agent import Agent
 from .logger import get_logger
+from .memory import MemoryManager
 from .tools import tools as base_tools
+from .tools.memory_tools import save_memory_tool, search_memory_tool
 from .llm import LLMClient
 from .permission import (
     FallbackApprovalHandler,
@@ -48,19 +50,28 @@ if __name__ == "__main__":
         model=model,
         context_limit=context_limit or 128000,
     )
+
+    # 记忆的召回/提取 side-query 可选用更便宜的模型省钱(对标 memdir 用 Sonnet 选记忆)。
+    # 配了 OPENAI_MEMORY_MODEL 就单独建个非流式 client,否则复用主 client。
+    memory_model = os.getenv("OPENAI_MEMORY_MODEL")
+    selector_llm = (
+        LLMClient(
+            base_url=base_url,
+            api_key=api_key,
+            model=memory_model,
+            stream=False,
+        )
+        if memory_model
+        else llm_client
+    )
+
     renderer = ConsoleRenderer()
 
-    prompt = (
-        # "你是主管 Agent。下面有两个相互【独立】的子任务，请用 spawn_agent 把它们"
-        # "分别委派给两个子 Agent 完成（不要自己动手做），最后用 final_answer 汇总两个"
-        # "子 Agent 的结论：\n"
-        # "子任务 A：计算 1 到 100 的整数之和，并把结果写入 sum_a.txt。\n"
-        # "子任务 B：用 web_search 查『2024 奥运会在哪个城市举办』，把答案写入 city_b.txt。"
-        "当前有哪些tool可以用"
-    )
     workspace_dir = Path(__file__).resolve().parent / "workspace"
+    # 多轮对话:session 整段存活,每轮把用户输入 append 进同一条历史。user_goal 只是
+    # 记录字段(主 agent 不依赖),交互模式下用占位串,首条输入由 REPL 循环喂入。
     session_state = SessionState.create(
-        user_goal=prompt,
+        user_goal="(interactive session)",
         workspace_dir=workspace_dir,
     )
 
@@ -106,6 +117,13 @@ if __name__ == "__main__":
         max_depth=2,
         permission_resolver=permission_resolver,
     )
+
+    # 记忆只给主 Agent:save/search 工具在 build_agent_tools 之后【单独追加】到主工具集,
+    # 不进 base_tools——所以 spawn_agent 为子 Agent 重建工具集时拿不到它们,子 Agent 保持
+    # 纯净隔离上下文(也不带记忆指令段,因为不注入 MemoryManager)。
+    memory_manager = MemoryManager(llm_client, selector_llm=selector_llm)
+    tools = [*tools, save_memory_tool, search_memory_tool]
+
     agent = Agent(
         llm_client,
         tools,
@@ -113,14 +131,26 @@ if __name__ == "__main__":
         renderer,
         keep_recent_tool_results=3,
         permission_resolver=permission_resolver,
+        memory=memory_manager,
     )
 
+    # ---- REPL:外层多轮循环 ----
+    # 对标 Claude Code 的 REPL：内层 agent.run() 把【一个 user turn】跑到 final_answer
+    # 就交还控制权;外层在这里读下一句输入,复用【同一个 agent / session】再 run。
+    # 历史天然续上——session_state.messages 累积全部上文,run() 每次只 append 新 user 消息。
+    # 退出:Ctrl-D / Ctrl-C / 输入 /exit | /quit。
     try:
-        agent.run(
-            # "执行 python 代码 print(1/0)，并且用 web_search 搜索 2024 年奥运会在哪举办，再对 ifconfig.me/ip 发起 http 请求拿到公网 IP。执行命令查看当前主机信息"
-            prompt
-            # '写一个坦克大战游戏项目，有完整的开发流程'
-        )
+        while True:
+            try:
+                user_input = input("\n> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()  # 让提示符换行,终端干净收尾
+                break
+            if not user_input:
+                continue
+            if user_input in ("/exit", "/quit"):
+                break
+            agent.run(user_input)
     finally:
         # 关闭 MCP session / stdio 子进程,避免残留进程。
         mcp_manager.shutdown()

@@ -239,6 +239,11 @@ class SessionState:
         self.total_usage.completion_tokens += usage.completion_tokens
         self.total_usage.total_tokens += usage.total_tokens
 
+    def mark_running(self) -> None:
+        # 多轮对话:新一轮开始时把上一轮留下的终态(completed/failed/max_steps)
+        # 重置回 running,让 status 始终反映"当前这轮"而非历史。
+        self.status = "running"
+
     def mark_completed(self) -> None:
         self.status = "completed"
 

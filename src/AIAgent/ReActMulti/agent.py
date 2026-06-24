@@ -7,6 +7,7 @@ from openai.types.chat import ChatCompletionMessageParam
 from .context import ContextCompactor
 from .events import ContentDelta, ContentDone, ReasoningDelta, UsageEvent
 from .executor import ToolExecutor
+from .memory import MemoryManager
 from .permission import PermissionResolver
 from .llm import LLMClient
 from .prompt import build_system_prompt
@@ -30,10 +31,14 @@ class Agent:
         max_consecutive_invalid: int = 3,
         permission_resolver: PermissionResolver | None = None,
         cancellation_check: Callable[[], bool] | None = None,
+        memory: MemoryManager | None = None,
     ):
         self.llm = llm
         self.session_state = session_state
         self.renderer = renderer
+        # 长期记忆协作者:只主 Agent 注入,子 Agent 传 None(保持纯净隔离上下文)。
+        # Agent 只在主循环里喊它三声:构造时取指令、每轮注入召回、收口后提取落盘。
+        self.memory = memory
         # 权限裁决器可由装配层注入(承载规则/模式配置),并沿主→子 Agent 共用同一份;
         # 不传则 ToolExecutor 自建一个无 handler 的默认 resolver(ask 一律 fail-closed)。
         self._permission_resolver = permission_resolver
@@ -51,12 +56,16 @@ class Agent:
         )
 
         if not self.session_state.message_records:
+            # 有记忆时把静态记忆指令段拼进 system prompt(类型分类法/如何保存/何时存取/
+            # 据记忆行动前先核实)。MEMORY.md 内容和相关记忆不在这里——走每轮注入保新鲜。
+            memory_section = self.memory.instructions() if self.memory else ""
             msg: ChatCompletionMessageParam = {
                 "role": "system",
                 "content": build_system_prompt(
                     json.dumps(
                         [tool.to_dict() for tool in tools], ensure_ascii=False, indent=2
-                    )
+                    ),
+                    memory_section=memory_section,
                 ),
             }
             self.session_state.append_message(msg)
@@ -127,7 +136,19 @@ class Agent:
         """执行任务直到模型给出 final_answer(返回它)或步数耗尽(返回 None)。"""
         max_steps = self.session_state.max_steps if max_steps is None else max_steps
         self.session_state.max_steps = max_steps
+        # 重置上一轮的终态,使 status 始终反映"当前这轮"(多轮 REPL 下尤其需要)。
+        self.session_state.mark_running()
         self.session_state.append_message({"role": "user", "content": prompt})
+
+        # 自动召回:针对本轮 prompt 选出相关记忆 + MEMORY.md 索引,作为 system-reminder
+        # 注入(role=user 以兼容各端点)。走 append_message 自动计入 context_tokens。
+        # 召回是尽力而为的旁路,内部已吞异常,空块则跳过。
+        if self.memory:
+            recall_block = self.memory.recall_block(prompt)
+            if recall_block:
+                self.session_state.append_message(
+                    {"role": "user", "content": recall_block}
+                )
 
         consecutive_invalid = 0
 
@@ -163,6 +184,10 @@ class Agent:
                         )
 
                     self.session_state.mark_completed()
+                    # 会话收口:从 transcript 自动提取值得长期保留的记忆并落盘。
+                    # best-effort——内部吞掉所有异常,绝不影响这里的返回值。
+                    if self.memory:
+                        self.memory.extract(self.session_state)
                     return turn.final_answer
 
                 if turn.kind == "tool_calls":

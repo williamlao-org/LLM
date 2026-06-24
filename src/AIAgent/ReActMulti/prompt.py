@@ -57,6 +57,13 @@ Rules (semantic constraints the schema above cannot express):
 """
 
 
-def build_system_prompt(tools_json: str) -> str:
-    """把工具清单 + 回合 schema 注入模板,生成完整 system prompt。"""
-    return SYSTEM_PROMPT.format(tools=tools_json, turn_schema=TURN_SCHEMA)
+def build_system_prompt(tools_json: str, memory_section: str = "") -> str:
+    """把工具清单 + 回合 schema 注入模板,生成完整 system prompt。
+
+    memory_section:可选的长期记忆指令段(由 MemoryManager.instructions() 提供),
+    非空时追加到末尾。普通(无记忆的)子 Agent 传空串,行为与原来完全一致。
+    """
+    prompt = SYSTEM_PROMPT.format(tools=tools_json, turn_schema=TURN_SCHEMA)
+    if memory_section:
+        prompt = f"{prompt}\n{memory_section}\n"
+    return prompt
