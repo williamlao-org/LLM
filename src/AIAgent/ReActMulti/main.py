@@ -51,11 +51,12 @@ if __name__ == "__main__":
     renderer = ConsoleRenderer()
 
     prompt = (
-        "你是主管 Agent。下面有两个相互【独立】的子任务，请用 spawn_agent 把它们"
-        "分别委派给两个子 Agent 完成（不要自己动手做），最后用 final_answer 汇总两个"
-        "子 Agent 的结论：\n"
-        "子任务 A：计算 1 到 100 的整数之和，并把结果写入 sum_a.txt。\n"
-        "子任务 B：用 web_search 查『2024 巴黎奥运会在哪个城市举办』，把答案写入 city_b.txt。"
+        # "你是主管 Agent。下面有两个相互【独立】的子任务，请用 spawn_agent 把它们"
+        # "分别委派给两个子 Agent 完成（不要自己动手做），最后用 final_answer 汇总两个"
+        # "子 Agent 的结论：\n"
+        # "子任务 A：计算 1 到 100 的整数之和，并把结果写入 sum_a.txt。\n"
+        # "子任务 B：用 web_search 查『2024 奥运会在哪个城市举办』，把答案写入 city_b.txt。"
+        "当前有哪些tool可以用"
     )
     workspace_dir = Path(__file__).resolve().parent / "workspace"
     session_state = SessionState.create(
