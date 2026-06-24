@@ -160,9 +160,7 @@ class McpManager:
                         session = await self._connect_one(stack, cfg)
                     except Exception as e:
                         # 单个 server 连不上不拖垮整体:log 后跳过,其余照常。
-                        logger.warning(
-                            "MCP server %r 连接失败,已跳过:%s", cfg.name, e
-                        )
+                        logger.warning("MCP server %r 连接失败,已跳过:%s", cfg.name, e)
                         continue
                     self.sessions[cfg.name] = session
                     listed = await session.list_tools()
@@ -174,6 +172,7 @@ class McpManager:
                         len(listed.tools),
                     )
                 # 交回工具列表让 start() 返回;本任务继续 park 住,session 保持存活。
+                assert self._ready is not None
                 self._ready.set_result(tools)
                 await self._shutdown_event.wait()
             # AsyncExitStack 在此退出——与进入它的是【同一个任务】,不触发 cancel scope 报错。
