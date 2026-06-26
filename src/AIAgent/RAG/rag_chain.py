@@ -26,6 +26,7 @@ from pathlib import Path
 from openai import OpenAI
 from embedder import APIEmbedder, LocalEmbedder
 from vector_store import SimpleVectorStore, ChromaVectorStore
+from hybrid_retriever import HybridRetriever
 from document_loader import load_documents
 from chunker import chunk_documents, Chunk
 from config import config
@@ -67,6 +68,8 @@ class RAGChain:
         embedder_type: str = "api",  # "api" 或 "local"
         # 向量库配置
         store_type: str = "simple",  # "simple" 或 "chroma"
+        # 检索方式
+        retriever_type: str = "dense",  # "dense"（纯向量）或 "hybrid"（向量 + BM25）
     ):
         # ===== 初始化 Embedder =====
         if embedder_type == "api":
@@ -100,11 +103,79 @@ class RAGChain:
         )
         self.llm_model = config.llm_model
 
+        # ===== 初始化检索器 =====
+        # dense：查询时直接用向量库检索
+        # hybrid：在向量库之上再挂一个 BM25，查询时两路融合（RRF）
+        self.retriever_type = retriever_type
+        if retriever_type == "hybrid":
+            print("🔧 初始化 HybridRetriever (Dense + BM25)...")
+            self.hybrid = HybridRetriever(self.embedder, self.store)
+        elif retriever_type == "dense":
+            self.hybrid = None
+        else:
+            raise ValueError(f"未知的 retriever_type: {retriever_type}")
+
         print("✅ RAG Chain 初始化完成\n")
 
     # ========== 离线阶段：构建索引 ==========
 
-    def build_index(self, docs_dir: str | Path | None = None):
+    def load_index(self, index_file: str | Path | None = None) -> bool:
+        """
+        从磁盘加载 SimpleVectorStore 索引
+
+        Args:
+            index_file: 索引文件路径，默认使用 config.simple_index_file
+
+        Returns:
+            是否成功加载到非空索引
+        """
+        index_file = Path(index_file or config.simple_index_file)
+
+        if not hasattr(self.store, "load"):
+            print("⚠️ 当前向量库不支持手动加载索引。")
+            return False
+
+        if not index_file.exists():
+            print(f"📭 未找到本地索引文件: {index_file}")
+            return False
+
+        try:
+            self.store.load(str(index_file))
+        except Exception as e:
+            print(f"⚠️ 本地索引加载失败，将重新构建: {e}")
+            return False
+
+        if len(self.store) == 0:
+            print("⚠️ 本地索引为空，将重新构建。")
+            return False
+
+        # Hybrid 模式：BM25 索引没存进磁盘缓存，用加载到的 chunks 现场重建
+        loaded_chunks = getattr(self.store, "chunks", None)
+        if self.hybrid is not None and loaded_chunks:
+            self.hybrid.sparse_store.clear()
+            self.hybrid.sparse_store.add(loaded_chunks)
+
+        return True
+
+    def save_index(self, index_file: str | Path | None = None):
+        """
+        保存 SimpleVectorStore 索引到磁盘
+
+        Args:
+            index_file: 索引文件路径，默认使用 config.simple_index_file
+        """
+        index_file = Path(index_file or config.simple_index_file)
+
+        if not hasattr(self.store, "save"):
+            raise TypeError("当前向量库不支持手动保存索引。")
+
+        self.store.save(str(index_file))
+
+    def build_index(
+        self,
+        docs_dir: str | Path | None = None,
+        clear_existing: bool = True,
+    ) -> int:
         """
         构建知识库索引
 
@@ -116,6 +187,10 @@ class RAGChain:
 
         Args:
             docs_dir: 文档目录路径，默认使用 config 中的配置
+            clear_existing: 入库前是否清空已有索引，避免重复追加
+
+        Returns:
+            本次构建并入库的 chunk 数量
         """
         docs_dir = docs_dir or config.docs_dir
 
@@ -124,7 +199,7 @@ class RAGChain:
         documents = load_documents(docs_dir)
         if not documents:
             print("⚠️ 没有找到文档！")
-            return
+            return 0
 
         # Step 2: 文本分块
         print("\n🔪 Step 2: 文本分块...")
@@ -152,9 +227,18 @@ class RAGChain:
 
         # Step 4: 存入向量库
         print("\n💾 Step 4: 存入向量库...")
+        if clear_existing and hasattr(self.store, "clear"):
+            self.store.clear()
         self.store.add(chunks, all_vectors)
 
+        # Hybrid 模式：同一批 chunk 再灌进 BM25 稀疏索引（不需要向量）
+        if self.hybrid is not None:
+            if clear_existing:
+                self.hybrid.sparse_store.clear()
+            self.hybrid.sparse_store.add(chunks)
+
         print(f"\n🎉 索引构建完成！共 {len(chunks)} 个 chunks 已入库")
+        return len(chunks)
 
     # ========== 在线阶段：查询回答 ==========
 
@@ -184,16 +268,21 @@ class RAGChain:
         """
         top_k = top_k or config.top_k
 
-        # Step 1: Query Embedding
+        # Step 1 + 2: 检索（dense 走向量库；hybrid 走 Dense + BM25 + RRF）
         if verbose:
             print(f"\n🔍 查询: {question}")
-            print("  1️⃣ 计算查询向量...")
-        query_vector = self.embedder.embed_query(question)
 
-        # Step 2: 检索
-        if verbose:
-            print(f"  2️⃣ 检索 Top-{top_k} 相关文档...")
-        results = self.store.search(query_vector, top_k=top_k)
+        if self.hybrid is not None:
+            if verbose:
+                print(f"  1️⃣+2️⃣ Hybrid 检索 Top-{top_k}（Dense + BM25 融合）...")
+            results = self.hybrid.search(question, top_k=top_k, verbose=verbose)
+        else:
+            if verbose:
+                print("  1️⃣ 计算查询向量...")
+            query_vector = self.embedder.embed_query(question)
+            if verbose:
+                print(f"  2️⃣ 检索 Top-{top_k} 相关文档...")
+            results = self.store.search(query_vector, top_k=top_k)
 
         if not results:
             return {
@@ -266,8 +355,8 @@ class RAGChain:
 
 # ===== 测试 =====
 if __name__ == "__main__":
-    # 快速测试整个 RAG 流程
-    rag = RAGChain(embedder_type="api", store_type="simple")
+    # 快速测试整个 RAG 流程（切到 hybrid 演示混合检索）
+    rag = RAGChain(embedder_type="api", store_type="simple", retriever_type="hybrid")
 
     # 构建索引
     rag.build_index()

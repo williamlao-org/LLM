@@ -72,6 +72,14 @@ class RAGConfig:
     db_dir: str | Path = (
         Path(__file__).resolve().parent / "chroma_db"
     )  # 向量数据库持久化目录
+    simple_index_file: str | Path = field(
+        default_factory=lambda: Path(
+            os.getenv(
+                "SIMPLE_INDEX_FILE",
+                Path(__file__).resolve().parent / "simple_index.json",
+            )
+        )
+    )  # SimpleVectorStore 的本地索引缓存文件
 
 
 # 全局配置实例

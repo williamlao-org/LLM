@@ -1,0 +1,3 @@
+# RAG runtime indexes
+simple_index.json
+chroma_db/

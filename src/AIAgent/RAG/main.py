@@ -2,7 +2,7 @@
 RAG 交互式问答入口
 
 启动后可以：
-1. 自动构建索引（如果向量库为空）
+1. 优先加载本地索引，缺失时自动构建
 2. 交互式提问，实时看到检索和生成过程
 3. 输入 /sources 查看最近一次回答的来源
 4. 输入 /rebuild 重建索引
@@ -32,10 +32,30 @@ def print_help():
 📖 可用命令:
   直接输入问题  → 进行 RAG 检索问答
   /sources     → 查看上次回答的来源详情
-  /rebuild     → 重建知识库索引
+  /rebuild     → 重建知识库索引并覆盖本地缓存
   /help        → 显示帮助
   /quit        → 退出程序
 """)
+
+
+def ensure_index(rag: RAGChain) -> bool:
+    """优先加载本地索引，加载不到时构建并保存。"""
+    print("📦 准备知识库索引...\n")
+
+    if rag.load_index():
+        print(f"✅ 已加载本地索引，共 {len(rag.store)} 个 chunks。\n")
+        return True
+
+    print("\n📦 本地索引不可用，开始构建知识库索引...\n")
+    built_count = rag.build_index()
+
+    if built_count == 0 or len(rag.store) == 0:
+        print("❌ 索引为空，无法启动问答。")
+        return False
+
+    rag.save_index()
+    print("✅ 索引已构建并保存到本地缓存。\n")
+    return True
 
 
 def main():
@@ -75,12 +95,12 @@ def main():
         print(f"❌ 初始化失败: {e}")
         return
 
-    # 构建索引
-    print("📦 构建知识库索引...\n")
+    # 加载或构建索引
     try:
-        rag.build_index()
+        if not ensure_index(rag):
+            return
     except Exception as e:
-        print(f"❌ 索引构建失败: {e}")
+        print(f"❌ 索引准备失败: {e}")
         return
 
     print_help()
@@ -121,8 +141,11 @@ def main():
 
             elif cmd == "/rebuild":
                 print("🔄 重建索引...\n")
-                rag = RAGChain(embedder_type="api", store_type="simple")
-                rag.build_index()
+                built_count = rag.build_index()
+                if built_count == 0:
+                    print("❌ 没有构建出任何索引，已保留当前缓存。")
+                    continue
+                rag.save_index()
                 print("✅ 索引重建完成！")
 
             else:

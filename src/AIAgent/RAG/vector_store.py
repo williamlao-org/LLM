@@ -123,6 +123,12 @@ class SimpleVectorStore:
         ]
         print(f"  📂 已加载 {len(self.vectors)} 条数据")
 
+    def clear(self):
+        """清空所有数据"""
+        self.vectors = []
+        self.chunks = []
+        print("  🗑️ 已清空数据")
+
     def __len__(self):
         return len(self.vectors)
 
