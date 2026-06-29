@@ -7,10 +7,16 @@ RAG Chain —— 串联完整的 RAG 流程
   用户问题
       │
       ▼
+  0. Query Rewriting（可选：改写 / HyDE / 多子查询）
+      │
+      ▼
   1. Embedding（把问题转向量）
       │
       ▼
   2. 检索（在向量库中找最相关的 chunks）
+      │
+      ▼
+  2.5 Reranking（可选：Cross-encoder 精排）
       │
       ▼
   3. 构造 Prompt（把检索结果 + 问题拼成 Prompt）
@@ -26,7 +32,11 @@ from pathlib import Path
 from openai import OpenAI
 from embedder import APIEmbedder, LocalEmbedder
 from vector_store import SimpleVectorStore, ChromaVectorStore
-from hybrid_retriever import HybridRetriever
+from hybrid_retriever import HybridRetriever, reciprocal_rank_fusion
+from reranker import APIReranker
+from retriever import DenseRetriever
+from sparse_retriever import BM25Retriever
+from query_rewriter import QueryRewriter
 from document_loader import load_documents
 from chunker import chunk_documents, Chunk
 from config import config
@@ -70,6 +80,10 @@ class RAGChain:
         store_type: str = "simple",  # "simple" 或 "chroma"
         # 检索方式
         retriever_type: str = "dense",  # "dense"（纯向量）或 "hybrid"（向量 + BM25）
+        # 重排序
+        use_reranker: bool = False,  # 是否启用 Cross-encoder 重排序
+        # 查询改写
+        query_rewrite: str = "none",  # "none" | "rewrite" | "hyde" | "multi_query"
     ):
         # ===== 初始化 Embedder =====
         if embedder_type == "api":
@@ -104,16 +118,49 @@ class RAGChain:
         self.llm_model = config.llm_model
 
         # ===== 初始化检索器 =====
-        # dense：查询时直接用向量库检索
-        # hybrid：在向量库之上再挂一个 BM25，查询时两路融合（RRF）
+        # DenseRetriever 封装“查询向量化 + 向量库检索”。
+        self.dense_retriever = DenseRetriever(self.embedder, self.store)
         self.retriever_type = retriever_type
         if retriever_type == "hybrid":
             print("🔧 初始化 HybridRetriever (Dense + BM25)...")
-            self.hybrid = HybridRetriever(self.embedder, self.store)
+            self.sparse_retriever = BM25Retriever()
+            self.hybrid = HybridRetriever(
+                self.dense_retriever,
+                self.sparse_retriever,
+            )
         elif retriever_type == "dense":
+            self.sparse_retriever = None
             self.hybrid = None
         else:
             raise ValueError(f"未知的 retriever_type: {retriever_type}")
+
+        # ===== 初始化 Reranker =====
+        self.use_reranker = use_reranker
+        if use_reranker:
+            print("🔧 初始化 Reranker (Cross-encoder)...")
+            self.reranker = APIReranker(
+                api_key=config.reranker_api_key,
+                model=config.reranker_model,
+                base_url=config.reranker_base_url,
+            )
+        else:
+            self.reranker = None
+
+        # ===== 初始化 Query Rewriter =====
+        self.query_rewrite = query_rewrite
+        if query_rewrite != "none":
+            strategy_label = {
+                "rewrite": "Query Rewriting（直接改写）",
+                "hyde": "HyDE（假设文档嵌入）",
+                "multi_query": "Multi-Query（多子查询）",
+            }.get(query_rewrite, query_rewrite)
+            print(f"🔧 初始化 QueryRewriter ({strategy_label})...")
+            self.query_rewriter = QueryRewriter(
+                llm_client=self.llm_client,
+                model=self.llm_model,
+            )
+        else:
+            self.query_rewriter = None
 
         print("✅ RAG Chain 初始化完成\n")
 
@@ -151,9 +198,10 @@ class RAGChain:
 
         # Hybrid 模式：BM25 索引没存进磁盘缓存，用加载到的 chunks 现场重建
         loaded_chunks = getattr(self.store, "chunks", None)
-        if self.hybrid is not None and loaded_chunks:
-            self.hybrid.sparse_store.clear()
-            self.hybrid.sparse_store.add(loaded_chunks)
+        sparse_retriever = getattr(self, "sparse_retriever", None)
+        if sparse_retriever is not None and loaded_chunks:
+            sparse_retriever.clear()
+            sparse_retriever.add(loaded_chunks)
 
         return True
 
@@ -232,10 +280,10 @@ class RAGChain:
         self.store.add(chunks, all_vectors)
 
         # Hybrid 模式：同一批 chunk 再灌进 BM25 稀疏索引（不需要向量）
-        if self.hybrid is not None:
+        if self.sparse_retriever is not None:
             if clear_existing:
-                self.hybrid.sparse_store.clear()
-            self.hybrid.sparse_store.add(chunks)
+                self.sparse_retriever.clear()
+            self.sparse_retriever.add(chunks)
 
         print(f"\n🎉 索引构建完成！共 {len(chunks)} 个 chunks 已入库")
         return len(chunks)
@@ -249,8 +297,10 @@ class RAGChain:
         对用户问题进行 RAG 查询
 
         完整流程：
+        0. Query Rewriting（可选：改写 / HyDE / 多子查询）
         1. 把问题转成向量
         2. 在向量库中检索最相关的 chunks
+        2.5 Cross-encoder Reranking（可选）
         3. 构造包含上下文的 Prompt
         4. 调用 LLM 生成回答
 
@@ -263,43 +313,171 @@ class RAGChain:
             {
                 "answer": "LLM 生成的回答",
                 "sources": [检索到的源文档信息],
-                "context": "实际注入 Prompt 的上下文"
+                "context": "实际注入 Prompt 的上下文",
+                "rewritten_query": "改写后的查询（none 时为 None）",
             }
         """
         top_k = top_k or config.top_k
 
-        # Step 1 + 2: 检索（dense 走向量库；hybrid 走 Dense + BM25 + RRF）
+        # 如果启用了 Reranker，召回阶段多取一些候选（candidate_k），
+        # 让 Reranker 有足够的素材做精排。
+        # 没有 Reranker 时，召回数 = 最终返回数 = top_k。
+        candidate_k = top_k * 3 if self.reranker is not None else top_k
+
         if verbose:
             print(f"\n🔍 查询: {question}")
 
+        # Step 0: Query Rewriting（如果启用）
+        # retrieval_query 是实际送进检索的查询；question 始终保留原始问题（用于 Prompt）
+        retrieval_query = question
+        rewritten_query = None
+
+        if self.query_rewriter is not None:
+            if self.query_rewrite == "rewrite":
+                if verbose:
+                    print("  0️⃣ Query Rewriting：改写查询...")
+                retrieval_query = self.query_rewriter.rewrite(question)
+                rewritten_query = retrieval_query
+                if verbose:
+                    print(f"     原始：{question}")
+                    print(f"     改写：{retrieval_query}")
+
+            elif self.query_rewrite == "hyde":
+                if verbose:
+                    print("  0️⃣ HyDE：生成假设答案...")
+                retrieval_query = self.query_rewriter.hyde(question)
+                rewritten_query = retrieval_query
+                if verbose:
+                    print(f"     假设答案（前100字）：{retrieval_query[:100]}...")
+
+            elif self.query_rewrite == "multi_query":
+                if verbose:
+                    print("  0️⃣ Multi-Query：分解子查询...")
+                sub_queries = self.query_rewriter.multi_query(question, n=3)
+                rewritten_query = sub_queries
+                if verbose:
+                    for i, sq in enumerate(sub_queries, 1):
+                        print(f"     [{i}] {sq}")
+
+                # 对每个子查询分别检索，然后 RRF 合并
+                # 注意：这里直接覆盖 results，后续流程（rerank/prompt）不感知多查询
+                if verbose:
+                    print(f"  1️⃣+2️⃣ Multi-Query 分别检索并 RRF 合并...")
+                all_result_lists = []
+                for sq in sub_queries:
+                    if self.hybrid is not None:
+                        sub_results = self.hybrid.search(sq, top_k=candidate_k, verbose=False)
+                    else:
+                        sub_results = self.dense_retriever.search(sq, top_k=candidate_k)
+                    all_result_lists.append(sub_results)
+
+                results = reciprocal_rank_fusion(all_result_lists, top_k=candidate_k)
+                if verbose:
+                    label = "粗排结果" if self.reranker else "检索结果"
+                    print(f"  📋 {label}（{len(sub_queries)} 路合并）:")
+                    for i, r in enumerate(results):
+                        source = r.chunk.metadata.get("source", "?")
+                        score = r.score
+                        preview = r.chunk.content[:80].replace("\n", " ")
+                        print(f"     [{i + 1}] (rrf: {score:.4f}) [{source}] {preview}...")
+
+                # multi_query 路径已经得到 results，跳过下面的普通检索
+                # 进入 rerank / prompt 阶段
+                if self.reranker is not None:
+                    if verbose:
+                        print(f"  🔄 Reranker 精排 Top-{candidate_k} → Top-{top_k}...")
+                    results = self.reranker.rerank(
+                        query=question,
+                        results=results,
+                        top_n=top_k,
+                        verbose=verbose,
+                    )
+                    if verbose:
+                        print(f"  📋 精排结果:")
+                        for i, r in enumerate(results):
+                            source = r.chunk.metadata.get("source", "?")
+                            preview = r.chunk.content[:80].replace("\n", " ")
+                            print(f"     [{i + 1}] (rerank: {r.score:.4f}) [{source}] {preview}...")
+
+                return self._build_response(
+                    question=question,
+                    results=results,
+                    top_k=top_k,
+                    verbose=verbose,
+                    rewritten_query=rewritten_query,
+                )
+
+        # Step 1 + 2: 检索（dense 走向量库；hybrid 走 Dense + BM25 + RRF）
+        # multi_query 路径已经提前 return，不会执行到这里
+
         if self.hybrid is not None:
             if verbose:
-                print(f"  1️⃣+2️⃣ Hybrid 检索 Top-{top_k}（Dense + BM25 融合）...")
-            results = self.hybrid.search(question, top_k=top_k, verbose=verbose)
+                label = f"Hybrid 召回 Top-{candidate_k}"
+                if self.reranker:
+                    label += "（Reranker 候选）"
+                print(f"  1️⃣+2️⃣ {label}（Dense + BM25 融合）...")
+            results = self.hybrid.search(retrieval_query, top_k=candidate_k, verbose=verbose)
         else:
             if verbose:
                 print("  1️⃣ 计算查询向量...")
-            query_vector = self.embedder.embed_query(question)
-            if verbose:
-                print(f"  2️⃣ 检索 Top-{top_k} 相关文档...")
-            results = self.store.search(query_vector, top_k=top_k)
+                print(f"  2️⃣ 检索 Top-{candidate_k} 相关文档...")
+            results = self.dense_retriever.search(retrieval_query, top_k=candidate_k)
 
         if not results:
             return {
                 "answer": "知识库中没有找到相关信息。",
                 "sources": [],
                 "context": "",
+                "rewritten_query": rewritten_query,
             }
 
-        # 打印检索结果
+        # 打印检索（粗排）结果
         if verbose:
-            print("  📋 检索结果:")
+            label = "粗排结果" if self.reranker else "检索结果"
+            print(f"  📋 {label}:")
             for i, r in enumerate(results):
-                source = r["chunk"].metadata.get("source", "?")
-                score = r["score"]
-                preview = r["chunk"].content[:80].replace("\n", " ")
-                print(f"     [{i + 1}] (相似度: {score:.4f}) [{source}] {preview}...")
+                source = r.chunk.metadata.get("source", "?")
+                score = r.score
+                preview = r.chunk.content[:80].replace("\n", " ")
+                print(f"     [{i + 1}] (score: {score:.4f}) [{source}] {preview}...")
 
+        # Step 2.5: Reranking（如果启用）
+        if self.reranker is not None:
+            if verbose:
+                print(f"  🔄 Reranker 精排 Top-{candidate_k} → Top-{top_k}...")
+            results = self.reranker.rerank(
+                query=question,  # Reranker 始终用原始问题打分（评的是相关性，不是改写质量）
+                results=results,
+                top_n=top_k,
+                verbose=verbose,
+            )
+            if verbose:
+                print(f"  📋 精排结果:")
+                for i, r in enumerate(results):
+                    source = r.chunk.metadata.get("source", "?")
+                    preview = r.chunk.content[:80].replace("\n", " ")
+                    print(f"     [{i + 1}] (rerank: {r.score:.4f}) [{source}] {preview}...")
+
+        return self._build_response(
+            question=question,
+            results=results,
+            top_k=top_k,
+            verbose=verbose,
+            rewritten_query=rewritten_query,
+        )
+
+    def _build_response(
+        self,
+        question: str,
+        results: list,
+        top_k: int,
+        verbose: bool,
+        rewritten_query=None,
+    ) -> dict:
+        """
+        把检索结果拼成 Prompt，调用 LLM，整理返回值。
+        抽成独立方法是为了让 query() 的 multi_query 路径复用同一套逻辑。
+        """
         # Step 3: 构造 Prompt
         if verbose:
             print("  3️⃣ 构造 Prompt...")
@@ -307,12 +485,12 @@ class RAGChain:
         # 把检索到的 chunks 拼成上下文
         context_parts = []
         for i, r in enumerate(results):
-            source = r["chunk"].metadata.get("source", "未知来源")
-            context_parts.append(f"[来源: {source}]\n{r['chunk'].content}")
+            source = r.chunk.metadata.get("source", "未知来源")
+            context_parts.append(f"[来源: {source}]\n{r.chunk.content}")
 
         context = "\n\n---\n\n".join(context_parts)
 
-        # 构造最终的 user prompt
+        # 构造最终的 user prompt（始终用原始问题，改写只影响检索，不影响回答意图）
         user_prompt = RAG_USER_PROMPT_TEMPLATE.format(
             context=context,
             question=question,
@@ -336,9 +514,9 @@ class RAGChain:
         # 整理来源信息
         sources = [
             {
-                "source": r["chunk"].metadata.get("source", "?"),
-                "score": r["score"],
-                "content_preview": r["chunk"].content[:100],
+                "source": r.chunk.metadata.get("source", "?"),
+                "score": r.score,
+                "content_preview": r.chunk.content[:100],
             }
             for r in results
         ]
@@ -350,23 +528,38 @@ class RAGChain:
             "answer": answer,
             "sources": sources,
             "context": context,
+            "rewritten_query": rewritten_query,
         }
 
 
 # ===== 测试 =====
 if __name__ == "__main__":
-    # 快速测试整个 RAG 流程（切到 hybrid 演示混合检索）
-    rag = RAGChain(embedder_type="api", store_type="simple", retriever_type="hybrid")
+    import sys
 
-    # 构建索引
-    rag.build_index()
+    # 从命令行参数选择 query_rewrite 策略（默认 none）
+    # 用法：uv run python rag_chain.py [none|rewrite|hyde|multi_query]
+    strategy = sys.argv[1] if len(sys.argv) > 1 else "none"
+    print(f"\n📌 Query Rewrite 策略: {strategy}\n")
 
-    # 测试几个问题
+    rag = RAGChain(
+        embedder_type="api",
+        store_type="simple",
+        retriever_type="hybrid",
+        use_reranker=True,
+        query_rewrite=strategy,
+    )
+
+    # 优先加载本地索引，若不存在则构建并保存
+    if not rag.load_index():
+        rag.build_index()
+        rag.save_index()
+
+    # 测试几个问题（覆盖三种策略各自的典型场景）
     print("\n" + "=" * 60)
-    rag.query("什么是自注意力机制？")
+    rag.query("这个 transformer 注意力的那个公式咋来的")  # 口语 → 适合 rewrite
 
     print("\n" + "=" * 60)
-    rag.query("RAG 解决了什么问题？")
+    rag.query("RAG 解决了什么问题？")                     # 标准问题
 
     print("\n" + "=" * 60)
-    rag.query("ReAct 是什么架构模式？")
+    rag.query("ReAct 和普通 Agent 有什么区别，各适合什么场景？")  # 多维度 → 适合 multi_query

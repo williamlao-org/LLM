@@ -38,6 +38,14 @@ class RAGConfig:
     embedding_model: str = "Pro/BAAI/bge-m3"
     embedding_dim: int = 1024  # BGE-M3 输出 1024 维向量
 
+    # ===== Reranker 配置 =====
+    # Cross-encoder 重排序，SiliconFlow 的 /rerank endpoint
+    reranker_base_url: str = "https://api.siliconflow.cn/v1"
+    reranker_api_key: str = field(
+        default_factory=lambda: os.getenv("SILICONFLOW_API_KEY", "")
+    )
+    reranker_model: str = "BAAI/bge-reranker-v2-m3"
+
     # ===== PDF OCR 配置 =====
     # 使用 SiliconFlow OpenAI 兼容接口处理扫描版 PDF 和复杂版式
     pdf_ocr_base_url: str = "https://api.siliconflow.cn/v1"

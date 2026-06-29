@@ -29,6 +29,7 @@ BM25 评分公式（对查询 Q 和文档 D）：
 import math
 from collections import Counter
 from chunker import Chunk
+from retriever import SearchResult
 
 
 # ========== 分词 ==========
@@ -90,7 +91,7 @@ class BM25Retriever:
         retriever = BM25Retriever()
         retriever.add(chunks)                  # 建索引（不需要向量！）
         results = retriever.search(query, top_k=3)
-        # results: [{"chunk": Chunk, "score": float}, ...]
+        # results: [SearchResult(chunk=Chunk, score=float), ...]
 
     注意：BM25 不需要 Embedding，纯靠词频统计，所以 add() 只吃 chunks。
     """
@@ -151,7 +152,9 @@ class BM25Retriever:
         for token, freq in df.items():
             self.idf[token] = math.log((N - freq + 0.5) / (freq + 0.5) + 1)
 
-        print(f"  📚 BM25 索引就绪：{len(self.chunks)} 篇文档，词表 {len(self.idf)} 个 token")
+        print(
+            f"  📚 BM25 索引就绪：{len(self.chunks)} 篇文档，词表 {len(self.idf)} 个 token"
+        )
 
     def _score(self, query_tokens: list[str], doc_idx: int) -> float:
         """计算查询对单篇文档的 BM25 分数（就是上面公式的 Σ）"""
@@ -172,7 +175,7 @@ class BM25Retriever:
 
         return score
 
-    def search(self, query: str, top_k: int = 3) -> list[dict]:
+    def search(self, query: str, top_k: int = 3) -> list[SearchResult]:
         """
         检索最相关的文档。
 
@@ -193,9 +196,9 @@ class BM25Retriever:
         # 按分数降序，取 Top-K
         scored.sort(key=lambda x: x[1], reverse=True)
 
-        results = []
+        results: list[SearchResult] = []
         for i, score in scored[:top_k]:
-            results.append({"chunk": self.chunks[i], "score": score})
+            results.append(SearchResult(chunk=self.chunks[i], score=score))
         return results
 
     def clear(self):
@@ -210,12 +213,20 @@ class BM25Retriever:
 # ===== 测试 =====
 if __name__ == "__main__":
     print("=" * 50)
-    print(f"测试 BM25Retriever（分词模式：{'jieba 词级' if _HAS_JIEBA else '字符级退化'}）")
+    print(
+        f"测试 BM25Retriever（分词模式：{'jieba 词级' if _HAS_JIEBA else '字符级退化'}）"
+    )
     print("=" * 50)
 
     chunks = [
-        Chunk(content="BGE-M3 是一个开源的中文 embedding 模型，输出 1024 维向量", metadata={"source": "doc1"}),
-        Chunk(content="向量数据库通过近似最近邻搜索来加速相似度检索", metadata={"source": "doc2"}),
+        Chunk(
+            content="BGE-M3 是一个开源的中文 embedding 模型，输出 1024 维向量",
+            metadata={"source": "doc1"},
+        ),
+        Chunk(
+            content="向量数据库通过近似最近邻搜索来加速相似度检索",
+            metadata={"source": "doc2"},
+        ),
         Chunk(content="今天的天气非常好，适合出去散步", metadata={"source": "doc3"}),
         Chunk(content="机器学习是人工智能的一个重要分支", metadata={"source": "doc4"}),
     ]
@@ -226,4 +237,4 @@ if __name__ == "__main__":
     for q in ["BGE-M3 的维度", "向量检索是怎么加速的", "天气怎么样"]:
         print(f"\n🔍 查询: {q}")
         for r in retriever.search(q, top_k=2):
-            print(f"  Score: {r['score']:.4f} | {r['chunk'].content}")
+            print(f"  Score: {r.score:.4f} | {r.chunk.content}")

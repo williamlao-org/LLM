@@ -21,6 +21,7 @@ import os
 import numpy as np
 from chunker import Chunk
 from embedder import cosine_similarity
+from retriever import SearchResult
 
 
 class SimpleVectorStore:
@@ -56,7 +57,9 @@ class SimpleVectorStore:
         self.chunks.extend(chunks)
         print(f"  💾 已存入 {len(chunks)} 条数据，总计 {len(self.vectors)} 条")
 
-    def search(self, query_vector: list[float], top_k: int = 3) -> list[dict]:
+    def search(
+        self, query_vector: list[float], top_k: int = 3
+    ) -> list[SearchResult]:
         """
         搜索最相似的文本块
 
@@ -70,7 +73,7 @@ class SimpleVectorStore:
             top_k: 返回的结果数量
 
         Returns:
-            [{"chunk": Chunk, "score": float}, ...]
+            SearchResult 列表
         """
         if not self.vectors:
             return []
@@ -85,14 +88,9 @@ class SimpleVectorStore:
         scores.sort(key=lambda x: x[1], reverse=True)
 
         # 返回 Top-K
-        results = []
+        results: list[SearchResult] = []
         for i, score in scores[:top_k]:
-            results.append(
-                {
-                    "chunk": self.chunks[i],
-                    "score": score,
-                }
-            )
+            results.append(SearchResult(chunk=self.chunks[i], score=score))
 
         return results
 
@@ -192,7 +190,9 @@ class ChromaVectorStore:
         )
         print(f"  💾 已存入 {len(chunks)} 条数据，总计 {self.collection.count()} 条")
 
-    def search(self, query_vector: list[float], top_k: int = 3) -> list[dict]:
+    def search(
+        self, query_vector: list[float], top_k: int = 3
+    ) -> list[SearchResult]:
         """搜索最相似的文本块"""
         if self.collection.count() == 0:
             return []
@@ -203,7 +203,7 @@ class ChromaVectorStore:
         )
 
         # 转换成统一的返回格式
-        output = []
+        output: list[SearchResult] = []
         for i in range(len(results["ids"][0])):
             chunk = Chunk(
                 content=results["documents"][0][i],
@@ -213,7 +213,7 @@ class ChromaVectorStore:
             # 余弦距离 = 1 - 余弦相似度
             distance = results["distances"][0][i] if results["distances"] else 0
             score = 1 - distance
-            output.append({"chunk": chunk, "score": score})
+            output.append(SearchResult(chunk=chunk, score=score))
 
         return output
 
@@ -262,4 +262,4 @@ if __name__ == "__main__":
     results = store.search(query, top_k=3)
     print("\n搜索结果:")
     for r in results:
-        print(f"  Score: {r['score']:.4f} | {r['chunk'].content}")
+        print(f"  Score: {r.score:.4f} | {r.chunk.content}")
