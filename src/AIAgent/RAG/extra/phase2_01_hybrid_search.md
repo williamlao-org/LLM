@@ -93,8 +93,8 @@ IDF(t) = ln( (N - df + 0.5) / (df + 0.5) + 1 )      # df = 含该词的文档数
 
 | 文件                    | 内容                | 关键接口                                                                                 |
 | :---------------------- | :------------------ | :--------------------------------------------------------------------------------------- |
-| `sparse_retriever.py` | 手写 BM25 + 分词    | `BM25Retriever().add(chunks)` / `.search(query_str, top_k)`                          |
-| `hybrid_retriever.py` | RRF 纯函数 + 编排类 | `reciprocal_rank_fusion(lists, k, top_k)` / `HybridRetriever(dense_retriever, sparse_retriever)` |
+| `phase2_01_sparse_retriever.py` | 手写 BM25 + 分词    | `BM25Retriever().add(chunks)` / `.search(query_str, top_k)`                          |
+| `phase2_01_hybrid_retriever.py` | RRF 纯函数 + 编排类 | `reciprocal_rank_fusion(lists, k, top_k)` / `HybridRetriever(dense_retriever, sparse_retriever)` |
 
 ### 接口对齐（刻意和 Phase 1 一致，便于融合）
 
@@ -114,8 +114,8 @@ IDF(t) = ln( (N - df + 0.5) / (df + 0.5) + 1 )      # df = 含该词的文档数
 ### 跑
 
 ```bash
-uv run python sparse_retriever.py    # 单测 BM25
-uv run python hybrid_retriever.py    # 单测 Dense+BM25+RRF（调真实 embedding API）
+uv run python phase2_01_sparse_retriever.py    # 单测 BM25
+uv run python phase2_01_hybrid_retriever.py    # 单测 Dense+BM25+RRF（调真实 embedding API）
 uv run python rag_chain.py           # 全链路（__main__ 已切到 retriever_type="hybrid"）
 ```
 
@@ -153,4 +153,4 @@ uv run python rag_chain.py           # 全链路（__main__ 已切到 retriever_
 - 典型流水线终态：`Hybrid 召回 Top-20 → Reranker 精排 → 取 Top-3 → 注入 Prompt`。
 - 候选模型：`BAAI/bge-reranker-v2-m3`（和现在的 bge-m3 同源，SiliconFlow 有 API）。
 
-> 新对话开场建议说：「我在学 Phase 2，第一块 Hybrid 已落地（见 phase2_hybrid_search.md），现在要做第二块 Reranking」。
+> 新对话开场建议说：「我在学 Phase 2，第一块 Hybrid 已落地（见 phase2_01_hybrid_search.md），现在要做第二块 Reranking」。

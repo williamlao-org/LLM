@@ -1,15 +1,10 @@
 from datetime import datetime
 from pathlib import Path
-import sys
 from types import SimpleNamespace
 
 import pytest
 
-RAG_DIR = Path(__file__).resolve().parent
-if str(RAG_DIR) not in sys.path:
-    sys.path.insert(0, str(RAG_DIR))
-
-from document_loader import DocumentLoader
+from phase1_document_loader import DocumentLoader
 
 
 def text_block(text, bbox=(0, 0, 100, 20)):
@@ -74,7 +69,7 @@ def test_document_metadata_has_stable_base_fields(tmp_path):
 
 
 def test_document_repr():
-    from document_loader import Document
+    from phase1_document_loader import Document
 
     # 1. Test standard document
     doc1 = Document(content="hello world", metadata={"source": "test.txt"})

@@ -17,6 +17,9 @@ dependencies = [
     "pymupdf>=1.27.2.3",
     "python-docx>=1.2.0",
     "jieba>=0.42.1",
+    "ragas>=0.4.3",
+    # RAGAS 0.4.3 仍会导入旧版 LangChain VertexAI 模块；等待上游修复后可移除此约束。
+    "langchain-community<0.4",
 ]
 
 [[tool.uv.index]]

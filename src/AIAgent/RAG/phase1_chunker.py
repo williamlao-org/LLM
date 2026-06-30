@@ -16,7 +16,7 @@
 import re
 from pathlib import Path
 from dataclasses import dataclass, field
-from document_loader import Document
+from phase1_document_loader import Document
 
 
 @dataclass
@@ -352,7 +352,7 @@ if __name__ == "__main__":
     print("\n" + "=" * 50)
     print("完整文档分块:")
     print("=" * 50)
-    from document_loader import load_documents
+    from phase1_document_loader import load_documents
     docs_dir = Path(__file__).resolve().parent / "docs"
     docs = load_documents(docs_dir)
 

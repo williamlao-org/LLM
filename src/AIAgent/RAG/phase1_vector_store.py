@@ -19,9 +19,9 @@
 import json
 import os
 import numpy as np
-from chunker import Chunk
-from embedder import cosine_similarity
-from retriever import SearchResult
+from phase1_chunker import Chunk
+from phase1_embedder import cosine_similarity
+from phase1_dense_retriever import SearchResult
 
 
 class SimpleVectorStore:

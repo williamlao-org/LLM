@@ -28,8 +28,8 @@ BM25 评分公式（对查询 Q 和文档 D）：
 
 import math
 from collections import Counter
-from chunker import Chunk
-from retriever import SearchResult
+from phase1_chunker import Chunk
+from phase1_dense_retriever import SearchResult
 
 
 # ========== 分词 ==========

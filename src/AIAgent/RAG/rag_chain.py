@@ -30,15 +30,15 @@ RAG Chain —— 串联完整的 RAG 流程
 
 from pathlib import Path
 from openai import OpenAI
-from embedder import APIEmbedder, LocalEmbedder
-from vector_store import SimpleVectorStore, ChromaVectorStore
-from hybrid_retriever import HybridRetriever, reciprocal_rank_fusion
-from reranker import APIReranker
-from retriever import DenseRetriever
-from sparse_retriever import BM25Retriever
-from query_rewriter import QueryRewriter
-from document_loader import load_documents
-from chunker import chunk_documents, Chunk
+from phase1_embedder import APIEmbedder, LocalEmbedder
+from phase1_vector_store import SimpleVectorStore, ChromaVectorStore
+from phase2_01_hybrid_retriever import HybridRetriever, reciprocal_rank_fusion
+from phase2_02_reranker import APIReranker
+from phase1_dense_retriever import DenseRetriever
+from phase2_01_sparse_retriever import BM25Retriever
+from phase2_03_query_rewriter import QueryRewriter
+from phase1_document_loader import load_documents
+from phase1_chunker import chunk_documents, Chunk
 from config import config
 
 

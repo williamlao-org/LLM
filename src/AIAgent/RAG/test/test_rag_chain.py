@@ -1,14 +1,6 @@
-import sys
-from pathlib import Path
-
-
-RAG_DIR = Path(__file__).resolve().parent
-if str(RAG_DIR) not in sys.path:
-    sys.path.insert(0, str(RAG_DIR))
-
-from chunker import Chunk
+from phase1_chunker import Chunk
 from rag_chain import RAGChain
-from vector_store import SimpleVectorStore
+from phase1_vector_store import SimpleVectorStore
 
 
 def make_chain_with_store(store):

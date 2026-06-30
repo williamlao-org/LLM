@@ -129,7 +129,7 @@ curl -X POST https://api.siliconflow.cn/v1/rerank \
 
 | 文件 | 内容 | 关键接口 |
 |:---|:---|:---|
-| `reranker.py` | APIReranker，调用 SiliconFlow /rerank | `APIReranker(api_key, model).rerank(query, results, top_n)` |
+| `phase2_02_reranker.py` | APIReranker，调用 SiliconFlow /rerank | `APIReranker(api_key, model).rerank(query, results, top_n)` |
 
 ### 修改文件
 
@@ -148,7 +148,7 @@ curl -X POST https://api.siliconflow.cn/v1/rerank \
 ### 跑
 
 ```bash
-uv run python reranker.py      # 单测 Reranker（mock 数据 + 真实 API）
+uv run python phase2_02_reranker.py      # 单测 Reranker（mock 数据 + 真实 API）
 uv run python rag_chain.py     # 全链路（Hybrid + Reranker）
 ```
 
@@ -216,4 +216,4 @@ Hybrid 粗排候选 9 条（`top_k * 3`），Reranker 精排取 Top-3：
 - **HyDE**：先让 LLM 生成一个"假设答案"，用假设答案的 embedding 去检索（而不是用问题本身）
 - **Multi-Query**：把一个复杂问题拆成多个子查询，分别检索后合并结果
 
-> 新对话开场建议说：「我在学 Phase 2，前两块 Hybrid 和 Reranking 已落地（见 phase2_hybrid_search.md 和 phase2_reranking.md），现在要做第三块 Query Rewriting」。
+> 新对话开场建议说：「我在学 Phase 2，前两块 Hybrid 和 Reranking 已落地（见 phase2_01_hybrid_search.md 和 phase2_02_reranking.md），现在要做第三块 Query Rewriting」。

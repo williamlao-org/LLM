@@ -1,8 +1,8 @@
-from chunker import Chunk
-from hybrid_retriever import HybridRetriever, reciprocal_rank_fusion
-from retriever import DenseRetriever, SearchResult
-from sparse_retriever import BM25Retriever
-from vector_store import SimpleVectorStore
+from phase1_chunker import Chunk
+from phase2_01_hybrid_retriever import HybridRetriever, reciprocal_rank_fusion
+from phase1_dense_retriever import DenseRetriever, SearchResult
+from phase2_01_sparse_retriever import BM25Retriever
+from phase1_vector_store import SimpleVectorStore
 
 
 class FakeEmbedder:

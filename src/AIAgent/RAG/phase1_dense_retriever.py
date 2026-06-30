@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Protocol
 
-from chunker import Chunk
+from phase1_chunker import Chunk
 
 
 @dataclass(slots=True)

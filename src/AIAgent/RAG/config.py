@@ -46,6 +46,22 @@ class RAGConfig:
     )
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
 
+    # ===== RAGAS 评估配置 =====
+    # RAGAS 内部用 LLM 作为评判（LLM-as-Judge），复用 DeepSeek 凭据
+    ragas_llm_base_url: str = field(
+        default_factory=lambda: os.getenv("LLM_BASE_URL", "https://api.deepseek.com")
+    )
+    ragas_llm_api_key: str = field(default_factory=lambda: os.getenv("LLM_API_KEY", ""))
+    ragas_llm_model: str = field(
+        default_factory=lambda: os.getenv("LLM_MODEL", "deepseek-chat")
+    )
+    # RAGAS 评估时同样需要 Embedding 来计算 Answer Relevancy，复用已有配置
+    ragas_embedding_base_url: str = "https://api.siliconflow.cn/v1"
+    ragas_embedding_api_key: str = field(
+        default_factory=lambda: os.getenv("SILICONFLOW_API_KEY", "")
+    )
+    ragas_embedding_model: str = "Pro/BAAI/bge-m3"
+
     # ===== PDF OCR 配置 =====
     # 使用 SiliconFlow OpenAI 兼容接口处理扫描版 PDF 和复杂版式
     pdf_ocr_base_url: str = "https://api.siliconflow.cn/v1"

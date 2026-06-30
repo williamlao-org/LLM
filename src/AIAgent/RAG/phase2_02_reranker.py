@@ -50,7 +50,7 @@ Phase 2 Hybrid Search 解决了"召回"，但召回结果仍然是粗排：
 
 import httpx
 
-from retriever import SearchResult
+from phase1_dense_retriever import SearchResult
 
 
 class APIReranker:
@@ -221,8 +221,8 @@ if __name__ == "__main__":
     from embedder import APIEmbedder
     from vector_store import SimpleVectorStore
     from retriever import DenseRetriever
-    from sparse_retriever import BM25Retriever
-    from hybrid_retriever import HybridRetriever
+    from phase2_01_sparse_retriever import BM25Retriever
+    from phase2_01_hybrid_retriever import HybridRetriever
 
     # 1. 初始化 Dense 检索器
     embedder = APIEmbedder(
