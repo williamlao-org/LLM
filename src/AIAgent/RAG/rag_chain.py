@@ -366,7 +366,7 @@ class RAGChain:
                 all_result_lists = []
                 for sq in sub_queries:
                     if self.hybrid is not None:
-                        sub_results = self.hybrid.search(sq, top_k=candidate_k, verbose=False)
+                        sub_results = self.hybrid.search(sq, top_k=candidate_k, verbose=verbose)
                     else:
                         sub_results = self.dense_retriever.search(sq, top_k=candidate_k)
                     all_result_lists.append(sub_results)
