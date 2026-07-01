@@ -193,7 +193,7 @@ class SelfRAGAssessor:
             temperature=0.1,  # 评估任务用低温度，保持稳定
         )
 
-        raw = response.choices[0].message.content.strip()
+        raw = (response.choices[0].message.content or "").strip()
 
         # 解析 JSON（兼容 markdown 代码块包裹）
         if raw.startswith("```"):
@@ -201,7 +201,9 @@ class SelfRAGAssessor:
 
         try:
             data = json.loads(raw)
-        except json.JSONDecodeError:
+            if not isinstance(data, dict):
+                raise ValueError("评估结果必须是 JSON 对象")
+        except (json.JSONDecodeError, ValueError):
             # 解析失败时保守处理：直接回答
             if verbose:
                 print(f"     ⚠️ 评估结果解析失败，保守处理（直接使用检索结果）")

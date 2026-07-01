@@ -158,7 +158,7 @@ class KnowledgeRouter:
             temperature=0.1,
         )
 
-        raw = response.choices[0].message.content.strip()
+        raw = (response.choices[0].message.content or "").strip()
 
         # 解析 JSON
         if raw.startswith("```"):
@@ -166,7 +166,9 @@ class KnowledgeRouter:
 
         try:
             data = json.loads(raw)
-        except json.JSONDecodeError:
+            if not isinstance(data, dict):
+                raise ValueError("路由结果必须是 JSON 对象")
+        except (json.JSONDecodeError, ValueError):
             # 解析失败：默认搜所有库
             all_names = list(self.knowledge_bases.keys())
             if verbose:
@@ -179,18 +181,26 @@ class KnowledgeRouter:
         selected = data.get("selected", [])
         reason = data.get("reason", "")
 
+        if not isinstance(selected, list):
+            selected = list(self.knowledge_bases)
+            reason += "（路由格式无效，回退到全部知识库）"
+        elif selected and not all(isinstance(name, str) for name in selected):
+            selected = list(self.knowledge_bases)
+            reason += "（路由目标格式无效，回退到全部知识库）"
+
         # 过滤不存在的知识库名称
         valid_selected = [name for name in selected if name in self.knowledge_bases]
 
-        # 如果全被过滤掉了（LLM 幻觉了不存在的名称），搜所有库
-        if not valid_selected:
+        # LLM 明确返回空列表表示无需检索；只有提供了名称但全部无效时，
+        # 才保守回退到全部知识库。
+        if selected and not valid_selected:
             valid_selected = list(self.knowledge_bases.keys())
             reason += "（路由目标无效，回退到全部知识库）"
 
         decision = RouteDecision(selected_kbs=valid_selected, reason=reason)
 
         if verbose:
-            kb_list = ", ".join(f"[{name}]" for name in decision.selected_kbs)
+            kb_list = ", ".join(f"[{name}]" for name in decision.selected_kbs) or "（无需检索）"
             print(f"     路由到: {kb_list}")
             print(f"     理由: {decision.reason}")
 

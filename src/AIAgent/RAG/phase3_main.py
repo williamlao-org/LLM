@@ -93,6 +93,12 @@ def format_steps(steps: list[dict]) -> str:
 
         icon = {
             "search_knowledge_base": "🔍",
+            "multi_hop_search": "🕵️",
+            "multi_hop_step": "🧩",
+            "assess_multi_hop_step": "🧪",
+            "retry_multi_hop_step": "🔁",
+            "replan_multi_hop": "🧭",
+            "finish_multi_hop": "🏁",
             "assess_retrieval_quality": "📊",
             "direct_answer": "💡",
         }.get(tool, "🔧")
@@ -189,7 +195,7 @@ def main():
                     print(f"\n📋 上次回答的 Agent 决策步骤:")
                     print(f"  总轮数: {last_result['iterations']}")
                     print(f"  使用检索: {'是' if last_result['used_retrieval'] else '否'}")
-                    print(f"\n  工具调用记录:")
+                    print(f"\n  执行步骤（含自动质量评估）:")
                     print(format_steps(last_result["steps"]))
                 else:
                     print("还没有查询记录。")
