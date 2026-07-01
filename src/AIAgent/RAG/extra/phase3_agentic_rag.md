@@ -14,6 +14,8 @@ Phase 3 ✅ Agentic RAG   ← 本文，已落地、已跑通
 Phase 4+ ⬜ 记忆系统 / GraphRAG（见 learning_roadmap.md）
 ```
 
+延伸笔记：[IRCoT、Plan-and-Execute 与工程化混合 RAG](phase3_ircot_and_hybrid_rag.md)
+
 ---
 
 ## 1. 一句话与动机
