@@ -63,6 +63,7 @@ from phase3_self_rag import RetrievalAssessment, SelfRAGAssessor
 from phase3_router import KnowledgeRouter, KnowledgeBase
 from phase3_query_decomposer import QueryDecomposer, QueryStep
 from phase3_hop_assessor import HopAssessment, HopAssessor
+from phase4_working_memory import WorkingMemory
 from config import config
 
 
@@ -1265,7 +1266,12 @@ class AgenticRAG:
         )
         return response.choices[0].message.content or "无法生成回答。"
 
-    def query(self, question: str, verbose: bool = True) -> dict:
+    def query(
+        self,
+        question: str,
+        verbose: bool = True,
+        memory: WorkingMemory | None = None,
+    ) -> dict:
         """
         Agentic RAG 查询。
 
@@ -1278,6 +1284,7 @@ class AgenticRAG:
         Args:
             question: 用户问题
             verbose: 是否打印思考过程
+            memory: 可选的滑动窗口短期记忆；不传时保持单轮无状态
 
         Returns:
             {
@@ -1294,12 +1301,25 @@ class AgenticRAG:
 
         messages = [
             {"role": "system", "content": self._system_prompt()},
-            {"role": "user", "content": question},
         ]
+        if memory is not None:
+            messages.extend(memory.get_context_messages())
+        messages.append({"role": "user", "content": question})
 
         steps = []
         used_retrieval = False
         tool_call_count = 0
+
+        def finish(answer: str, iterations: int) -> dict:
+            """统一组装结果，并且只在成功得到最终答案后写入记忆。"""
+            if memory is not None:
+                memory.add_turn(question, answer)
+            return {
+                "answer": answer,
+                "steps": steps,
+                "iterations": iterations,
+                "used_retrieval": used_retrieval,
+            }
 
         for iteration in range(self.max_iterations):
             if verbose:
@@ -1321,12 +1341,7 @@ class AgenticRAG:
                 if verbose:
                     print(f"\n💡 Agent 最终回答:\n{answer}")
 
-                return {
-                    "answer": answer,
-                    "steps": steps,
-                    "iterations": iteration + 1,
-                    "used_retrieval": used_retrieval,
-                }
+                return finish(answer, iteration + 1)
 
             # 情况 2：LLM 调用了工具
             # 先把 assistant message 加到对话历史
@@ -1409,12 +1424,7 @@ class AgenticRAG:
                 })
 
                 if fn_name == "direct_answer" and sole_tool_call and result:
-                    return {
-                        "answer": result,
-                        "steps": steps,
-                        "iterations": iteration + 1,
-                        "used_retrieval": used_retrieval,
-                    }
+                    return finish(result, iteration + 1)
 
             if tool_call_count >= self.max_tool_calls:
                 force_final = True
@@ -1427,12 +1437,7 @@ class AgenticRAG:
                 )
                 if verbose:
                     print(f"\n💡 Agent 最终回答:\n{answer}")
-                return {
-                    "answer": answer,
-                    "steps": steps,
-                    "iterations": iteration + 1,
-                    "used_retrieval": used_retrieval,
-                }
+                return finish(answer, iteration + 1)
 
         # 超过最大轮数
         answer = self._force_final_answer(
@@ -1444,12 +1449,7 @@ class AgenticRAG:
         if verbose:
             print(f"\n💡 Agent 最终回答:\n{answer}")
 
-        return {
-            "answer": answer,
-            "steps": steps,
-            "iterations": self.max_iterations,
-            "used_retrieval": used_retrieval,
-        }
+        return finish(answer, self.max_iterations)
 
 
 # ========== 对比模式：传统 RAG vs Agentic RAG ==========

@@ -18,12 +18,12 @@ RAG ≈ "去图书馆查资料" 的能力
 
 更具体地说：
 
-| 概念 | 本质 | 解决的问题 |
-|:---|:---|:---|
-| **RAG** | 检索增强生成 | LLM 知识不够 / 需要外部数据 |
-| **短期记忆** | 上下文管理 | 当前对话/任务的连贯性 |
-| **长期记忆** | 持久化存储 + 检索 | 跨会话的知识保留 |
-| **记忆系统** | 整体架构 | 统一管理短期、长期、经验记忆 |
+| 概念               | 本质              | 解决的问题                   |
+| :----------------- | :---------------- | :--------------------------- |
+| **RAG**      | 检索增强生成      | LLM 知识不够 / 需要外部数据  |
+| **短期记忆** | 上下文管理        | 当前对话/任务的连贯性        |
+| **长期记忆** | 持久化存储 + 检索 | 跨会话的知识保留             |
+| **记忆系统** | 整体架构          | 统一管理短期、长期、经验记忆 |
 
 所以它们的关系是：
 
@@ -75,6 +75,7 @@ Phase 6: 综合系统（2 周）
 > **目标**：理解 RAG 的核心流水线，能动手搭一个能用的 RAG 系统
 
 ### 要学的核心概念
+
 - 文档加载与解析（PDF、Markdown、HTML）
 - 文本分块策略（Fixed Size、Recursive、Sentence Splitting）
 - Embedding 模型（OpenAI、BGE、Jina）
@@ -83,6 +84,7 @@ Phase 6: 综合系统（2 周）
 - Prompt 工程：如何把检索结果注入 Prompt
 
 ### 动手项目
+
 ```
 📦 项目：个人知识库问答系统
 ├── 加载一批文档（比如你自己的学习笔记）
@@ -92,11 +94,13 @@ Phase 6: 综合系统（2 周）
 ```
 
 ### 推荐学习资源
+
 - LangChain 的 RAG 教程（理解概念，但不要绑定框架）
 - LlamaIndex 官方文档（更 RAG-focused）
 - 论文：《Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks》(Lewis et al., 2020)
 
 ### 学习方式建议
+
 > [!TIP]
 > **先不要用框架**。自己用 Python + OpenAI API + Chroma 手写一遍完整流程。理解每个环节在做什么之后，再看 LangChain/LlamaIndex 是怎么封装的。这样你才真正理解，而不是只会调 API。
 
@@ -109,26 +113,31 @@ Phase 6: 综合系统（2 周）
 ### 要学的核心概念
 
 #### 2.1 检索优化
+
 - **混合检索 (Hybrid Search)**：Dense（向量）+ Sparse（BM25）组合
 - **重排序 (Re-ranking)**：Cross-encoder 对初检结果二次排序
 - **Reciprocal Rank Fusion (RRF)**：多路检索结果融合
 
 #### 2.2 分块优化
+
 - **语义分块 (Semantic Chunking)**：按语义边界而非固定大小切块
 - **上下文增强 (Contextual Retrieval)**：给每个 chunk 注入所属文档的摘要上下文
 - **Late Chunking**：先 embedding 整篇文档，再切块
 
 #### 2.3 查询优化
+
 - **查询改写 (Query Rewriting)**：LLM 把用户问题改写成更适合检索的形式
 - **HyDE (Hypothetical Document Embeddings)**：先生成假设答案，用假设答案去检索
 - **多查询检索 (Multi-Query)**：将一个问题分解为多个子查询，分别检索后合并
 
 #### 2.4 评估
+
 - **检索评估**：Precision@K、Recall@K、MRR、NDCG
 - **生成评估**：Faithfulness（忠实度）、Relevance（相关性）、Groundedness（有据性）
 - 工具：RAGAS、DeepEval
 
 ### 动手项目
+
 ```
 📦 项目：升级 Phase 1 的知识库
 ├── 添加 BM25 + 向量检索的混合检索
@@ -150,6 +159,7 @@ Phase 6: 综合系统（2 周）
 ### 为什么需要 Agentic RAG？
 
 传统 RAG 是"无脑检索"——不管用户问什么都去检索。但很多时候：
+
 - 用户问的是常识，不需要检索
 - 一次检索不够，需要多轮迭代
 - 需要从多个知识库检索并综合
@@ -157,6 +167,7 @@ Phase 6: 综合系统（2 周）
 Agentic RAG 的核心思想：**把检索变成 Agent 的一个工具，让 Agent 自己决定何时、如何检索**。
 
 ### 要学的核心概念
+
 - **检索即工具 (Retrieval as Tool)**：把 RAG 封装成 Agent 可调用的 Tool
 - **自适应检索 (Adaptive Retrieval)**：Agent 判断是否需要检索
 - **多跳检索 (Multi-hop Retrieval)**：一次检索结果不够，基于中间结果继续检索
@@ -164,6 +175,7 @@ Agentic RAG 的核心思想：**把检索变成 Agent 的一个工具，让 Agen
 - **路由选择 (Router)**：根据查询类型路由到不同知识库
 
 ### 动手项目
+
 ```
 📦 项目：给你的 ReActMulti Agent 添加 RAG 工具
 ├── 把知识库检索封装成 MCP Tool
@@ -190,29 +202,34 @@ Agentic RAG 的核心思想：**把检索变成 Agent 的一个工具，让 Agen
 ### 要学的核心概念
 
 #### 4.1 短期记忆 (Working Memory)
+
 - 上下文窗口管理策略
 - 对话历史压缩/摘要（Conversation Summarization）
 - 滑动窗口 vs Token-based Truncation vs Summary Buffer
 - 关键信息提取与保留
 
 #### 4.2 情景记忆 (Episodic Memory)
+
 - 任务执行日志的结构化存储
 - 成功/失败经验的记录与检索
 - 反思机制 (Reflection)：Agent 对过去经验的总结
 - Few-shot 经验库：从历史中自动选择相关示例
 
 #### 4.3 语义记忆 (Semantic Memory / Long-term)
+
 - 用户画像的持久化（偏好、习惯、身份信息）
 - 知识的时间版本管理（事实的新旧更替）
 - 自动知识提取：从对话中自动抽取事实存储
 - 冲突检测与解决：新信息和旧信息矛盾时怎么处理
 
 #### 4.4 记忆管理
+
 - **记忆的 CRUD**：创建、读取、更新、删除
 - **遗忘机制**：不重要的信息逐渐衰减
 - **自管理**：Agent 自己决定什么该记住、什么该忘掉
 
 ### 动手项目
+
 ```
 📦 项目：给 Agent 搭建完整的记忆系统
 ├── 短期记忆
@@ -230,6 +247,7 @@ Agentic RAG 的核心思想：**把检索变成 Agent 的一个工具，让 Agen
 ```
 
 ### 推荐研究的框架（学习思路，不一定要用）
+
 - **Mem0**：理解可插拔记忆层的设计思路
 - **Letta (MemGPT)**：理解 OS 式三层记忆管理
 
@@ -245,11 +263,13 @@ Agentic RAG 的核心思想：**把检索变成 Agent 的一个工具，让 Agen
 ### 为什么需要图？
 
 向量检索擅长"这段话和问题语义相似"，但不擅长：
+
 - "A 和 B 之间有什么关系？"
 - "所有和 X 相关的 Y 有哪些？"（多跳）
 - "整个文档集的主题是什么？"（全局理解）
 
 ### 要学的核心概念
+
 - 知识图谱基础：三元组 (Entity - Relation - Entity)
 - 从文本自动构建知识图谱（LLM-based extraction）
 - 图数据库：Neo4j 基础
@@ -259,6 +279,7 @@ Agentic RAG 的核心思想：**把检索变成 Agent 的一个工具，让 Agen
 - 混合架构：向量检索 + 图检索的融合
 
 ### 动手项目
+
 ```
 📦 项目：构建 GraphRAG 系统
 ├── 用 LLM 从文档中自动抽取实体和关系
@@ -270,6 +291,7 @@ Agentic RAG 的核心思想：**把检索变成 Agent 的一个工具，让 Agen
 ```
 
 ### 推荐资源
+
 - Microsoft GraphRAG 开源项目及论文
 - Neo4j + LangChain 的 GraphRAG 教程
 - 论文：《From Local to Global: A Graph RAG Approach to Query-Focused Summarization》
@@ -297,6 +319,7 @@ Agentic RAG 的核心思想：**把检索变成 Agent 的一个工具，让 Agen
 ```
 
 ### 综合项目
+
 ```
 📦 项目：全能型 AI 助手
 ├── 能理解并记住用户（记忆系统）
@@ -314,18 +337,19 @@ Agentic RAG 的核心思想：**把检索变成 Agent 的一个工具，让 Agen
 ### ✅ 推荐的学习方式
 
 1. **概念先行，代码跟上**
+
    - 每个 Phase 先花 2-3 天读论文/博客理解原理
    - 然后花 1-2 周手写实现
-
 2. **先裸写，再框架**
+
    - 不要一开始就用 LangChain / LlamaIndex
    - 用 Python + API 手写一遍，理解原理后再看框架如何抽象
-
 3. **对比驱动学习**
+
    - 每学一个新技术，和之前的版本做 A/B 对比
    - 比如：纯向量检索 vs 混合检索 vs GraphRAG
-
 4. **写博客/笔记**
+
    - 每完成一个 Phase，写一篇总结
    - 教是最好的学
 
@@ -341,15 +365,15 @@ Agentic RAG 的核心思想：**把检索变成 Agent 的一个工具，让 Agen
 
 ## 时间估算
 
-| Phase | 主题 | 预计时间 | 前置依赖 |
-|:---|:---|:---|:---|
-| 1 | 经典 RAG | 2 周 | Python + LLM API 基础 |
-| 2 | 进阶 RAG | 2-3 周 | Phase 1 |
-| 3 | Agentic RAG | 2 周 | Phase 2 + ReAct Agent |
-| 4 | 记忆系统 | 2-3 周 | Phase 1-3 |
-| 5 | GraphRAG | 2-3 周 | Phase 2 |
-| 6 | 综合系统 | 2 周 | Phase 1-5 |
-| **总计** | | **约 12-16 周** | |
+| Phase          | 主题        | 预计时间              | 前置依赖              |
+| :------------- | :---------- | :-------------------- | :-------------------- |
+| 1              | 经典 RAG    | 2 周                  | Python + LLM API 基础 |
+| 2              | 进阶 RAG    | 2-3 周                | Phase 1               |
+| 3              | Agentic RAG | 2 周                  | Phase 2 + ReAct Agent |
+| 4              | 记忆系统    | 2-3 周                | Phase 1-3             |
+| 5              | GraphRAG    | 2-3 周                | Phase 2               |
+| 6              | 综合系统    | 2 周                  | Phase 1-5             |
+| **总计** |             | **约 12-16 周** |                       |
 
 > [!NOTE]
 > 你已经有了 ReAct + MCP 的基础，所以 Phase 3 对你来说会特别顺。建议从 Phase 1 开始扎实走，到 Phase 3 的时候你会有一个"啊，原来是这么回事"的顿悟时刻。
