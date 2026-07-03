@@ -8,12 +8,21 @@ Phase 4.2: 按 Token 预算裁剪的短期记忆。
 
 from collections import deque
 from math import ceil
-from typing import Callable
+from typing import Any, Callable
+
+from tokenizers import Tokenizer
 
 from phase4_working_memory import ConversationTurn
 
 
 TokenCounter = Callable[[str], int]
+TurnTokenCounter = Callable[[ConversationTurn], int]
+
+DEEPSEEK_V4_TOKENIZER_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+DEEPSEEK_V4_USER_TOKEN = "<｜User｜>"
+DEEPSEEK_V4_ASSISTANT_TOKEN = "<｜Assistant｜>"
+DEEPSEEK_V4_THINKING_END_TOKEN = "</think>"
+DEEPSEEK_V4_EOS_TOKEN = "<｜end▁of▁sentence｜>"
 
 
 def estimate_text_tokens(text: str) -> int:
@@ -29,6 +38,46 @@ def estimate_text_tokens(text: str) -> int:
     return non_ascii_count + ceil(ascii_count / 4)
 
 
+class DeepSeekV4TokenCounter:
+    """使用 DeepSeek V4 官方 tokenizer 精确计算历史 Token。"""
+
+    def __init__(self, tokenizer: Any, model: str = DEEPSEEK_V4_TOKENIZER_MODEL):
+        self.tokenizer = tokenizer
+        self.model = model
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model: str = DEEPSEEK_V4_TOKENIZER_MODEL,
+    ) -> "DeepSeekV4TokenCounter":
+        """首次从 Hugging Face 下载 tokenizer，后续复用本机缓存。"""
+        try:
+            tokenizer = Tokenizer.from_pretrained(model)
+        except Exception as error:
+            raise RuntimeError(
+                f"无法加载 DeepSeek tokenizer {model}；"
+                "请检查 Hugging Face 网络或本机缓存"
+            ) from error
+        return cls(tokenizer=tokenizer, model=model)
+
+    def _count_encoded(self, text: str) -> int:
+        encoding = self.tokenizer.encode(text, add_special_tokens=False)
+        return len(encoding.ids)
+
+    def count_text(self, text: str) -> int:
+        """计算纯文本 Token，用于滚动摘要预算。"""
+        return self._count_encoded(str(text))
+
+    def count_turn(self, turn: ConversationTurn) -> int:
+        """按 DeepSeek V4 chat 模式计算一个完整历史问答。"""
+        encoded_turn = (
+            f"{DEEPSEEK_V4_USER_TOKEN}{turn.user}"
+            f"{DEEPSEEK_V4_ASSISTANT_TOKEN}{DEEPSEEK_V4_THINKING_END_TOKEN}"
+            f"{turn.assistant}{DEEPSEEK_V4_EOS_TOKEN}"
+        )
+        return self._count_encoded(encoded_turn)
+
+
 class TokenBudgetMemory:
     """保留不超过 Token 预算的连续、最新完整问答。"""
 
@@ -36,6 +85,7 @@ class TokenBudgetMemory:
         self,
         max_tokens: int,
         token_counter: TokenCounter | None = None,
+        turn_token_counter: TurnTokenCounter | None = None,
         tokens_per_message: int = 4,
     ):
         if max_tokens <= 0:
@@ -46,6 +96,7 @@ class TokenBudgetMemory:
         self.max_tokens = max_tokens
         self.tokens_per_message = tokens_per_message
         self.token_counter = token_counter or estimate_text_tokens
+        self.turn_token_counter = turn_token_counter
         self.current_tokens = 0
         self._turns: deque[tuple[ConversationTurn, int]] = deque()
 
@@ -58,6 +109,14 @@ class TokenBudgetMemory:
         return count
 
     def _count_turn(self, turn: ConversationTurn) -> int:
+        if self.turn_token_counter is not None:
+            count = self.turn_token_counter(turn)
+            if isinstance(count, bool) or not isinstance(count, int):
+                raise TypeError("turn_token_counter 必须返回 int")
+            if count < 0:
+                raise ValueError("turn_token_counter 不能返回负数")
+            return count
+
         content_tokens = (
             self._count_text(turn.user) + self._count_text(turn.assistant)
         )

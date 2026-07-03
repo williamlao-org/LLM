@@ -1284,7 +1284,7 @@ class AgenticRAG:
         Args:
             question: 用户问题
             verbose: 是否打印思考过程
-            memory: 可选的滑动窗口短期记忆；不传时保持单轮无状态
+            memory: 可选的短期记忆；不传时保持单轮无状态
 
         Returns:
             {

@@ -27,6 +27,12 @@ class RAGConfig:
     llm_model: str = field(
         default_factory=lambda: os.getenv("LLM_MODEL", "deepseek-chat")
     )
+    llm_tokenizer_model: str = field(
+        default_factory=lambda: os.getenv(
+            "LLM_TOKENIZER_MODEL",
+            "deepseek-ai/DeepSeek-V4-Flash",
+        )
+    )
 
     # ===== Embedding 配置 =====
     # SiliconFlow 的 BGE-M3 作为 Embedding 模型

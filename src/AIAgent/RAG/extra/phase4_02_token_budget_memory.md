@@ -34,15 +34,25 @@ Token Budget Memory 的规则是：
 
 本步不自动推导生产环境预算，而是先用小预算观察裁剪行为。
 
-## 3. Token 计数器为什么可注入
+## 3. DeepSeek V4 精确计数
 
-默认本地估算器使用一个可解释的粗略规则：
+Phase 4 CLI 在 `tokens` 和 `summary` 策略下会加载官方
+`deepseek-ai/DeepSeek-V4-Flash` tokenizer。它不仅计算问答正文，也会按
+DeepSeek V4 chat 格式计入：
 
-- 非 ASCII 字符：约 1 字符/token
-- ASCII 字符：约 4 字符/token
-- 每条 message 额外计入 4 个结构 Token
+```text
+<｜User｜>{user}<｜Assistant｜></think>{assistant}<｜end▁of▁sentence｜>
+```
 
-不同模型的 tokenizer 不同，因此这只是学习和离线测试用的估算。`TokenBudgetMemory` 接受 `token_counter` 参数，以后可直接注入 DeepSeek 对应的精确 tokenizer，无需改动记忆裁剪逻辑。
+第一次运行会从 Hugging Face 下载 tokenizer，之后复用本机缓存。
+可通过 `LLM_TOKENIZER_MODEL` 更换 tokenizer 仓库。加载失败会终止初始化，
+不会静默退回估算。
+
+`TokenBudgetMemory` 仍保留可注入的旧计数器接口，便于离线单元测试和
+其他模型接入。但 Phase 4 CLI 不再使用字符比例估算。
+
+这里的预算仍只针对历史问答。完整 API 请求的最终计费数量以
+`response.usage` 为准。
 
 ## 4. 对比实验
 
