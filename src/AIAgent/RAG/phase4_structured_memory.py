@@ -2,10 +2,11 @@
 
 import json
 import re
-from typing import Any, Literal, Protocol
+from typing import Any, Callable, Literal, Protocol
 
 from pydantic import BaseModel, Field, model_validator
 
+from phase4_token_memory import estimate_text_tokens
 from phase4_working_memory import ConversationTurn, WorkingMemory
 
 
@@ -70,31 +71,47 @@ class WorkingStateExtractor(Protocol):
         ...
 
 
-class SignalOrBatchUpdatePolicy:
-    """显式记忆信号立即触发，其余回合按数量批处理。"""
+class TokenAndBreakUpdatePolicy:
+    """按 Token 增长与对话停顿触发记忆更新的策略（模仿 Claude Code）。"""
 
-    _SIGNAL_PATTERN = re.compile(
-        r"(我叫|我是|叫我|称呼我|"
-        r"我喜欢|我不喜欢|我偏好|我的(?:习惯|爱好)|"
-        r"必须|不要|不能|务必|"
-        r"决定|选择|就用|"
-        r"待办|记得|之后要|需要做|"
-        r"改成|现在改|不再|忘记|删除)"
-    )
+    def __init__(
+        self,
+        min_tokens_between_updates: int = 150,
+        min_tool_calls_between_updates: int = 3,
+        token_counter: Callable[[str], int] | None = None,
+    ):
+        self.min_tokens_between_updates = min_tokens_between_updates
+        self.min_tool_calls_between_updates = min_tool_calls_between_updates
+        self.token_counter = token_counter or estimate_text_tokens
 
-    def __init__(self, max_pending_turns: int = 5):
-        if max_pending_turns <= 0:
-            raise ValueError("max_pending_turns 必须大于 0")
-        self.max_pending_turns = max_pending_turns
+    def _count_tool_calls(self, turn: ConversationTurn) -> int:
+        # 在当前简化设计中，我们通过分析助手回答文本中包含的工具特征词来计数
+        # 比如统计 "tool_call" 或 "search_kb" 的出现次数
+        text = turn.assistant.lower()
+        return text.count("tool_call") + text.count("search_kb")
 
     def should_extract(
         self,
         newest_turn: ConversationTurn,
-        pending_count: int,
+        pending_turns: list[ConversationTurn],
     ) -> bool:
-        return (
-            pending_count >= self.max_pending_turns
-            or bool(self._SIGNAL_PATTERN.search(newest_turn.user))
+        # 计算当前 pending 队列中的总 Token 增长数
+        total_new_tokens = sum(
+            self.token_counter(t.user) + self.token_counter(t.assistant)
+            for t in pending_turns
+        )
+        has_met_token_threshold = total_new_tokens >= self.min_tokens_between_updates
+
+        # 统计 pending 队列中的累计工具调用次数
+        total_tool_calls = sum(self._count_tool_calls(t) for t in pending_turns)
+        has_met_tool_call_threshold = total_tool_calls >= self.min_tool_calls_between_updates
+
+        # 自然停顿点（Natural Break）：如果最新一轮回复中没有发生任何工具调用动作
+        is_natural_break = self._count_tool_calls(newest_turn) == 0
+
+        # 触发条件：Token 增长满足硬门槛，且（累计工具调用次数超限 OR 处于自然停顿）
+        return has_met_token_threshold and (
+            has_met_tool_call_threshold or is_natural_break
         )
 
 
@@ -205,15 +222,17 @@ class StructuredWorkingMemory:
         self,
         base_memory: WorkingMemory,
         extractor: WorkingStateExtractor,
-        update_policy: SignalOrBatchUpdatePolicy | None = None,
+        update_policy: TokenAndBreakUpdatePolicy | None = None,
         max_entries: int = 30,
+        filepath: str | None = None,
     ):
         if max_entries <= 0:
             raise ValueError("max_entries 必须大于 0")
         self.base_memory = base_memory
         self.extractor = extractor
-        self.update_policy = update_policy or SignalOrBatchUpdatePolicy()
+        self.update_policy = update_policy or TokenAndBreakUpdatePolicy()
         self.max_entries = max_entries
+        self.filepath = filepath
 
         self.last_extraction_error: str | None = None
         self.last_operations: tuple[MemoryOperation, ...] = ()
@@ -222,6 +241,40 @@ class StructuredWorkingMemory:
         self._entries: dict[tuple[str, str], MemoryEntry] = {}
         self._pending_turns: list[ConversationTurn] = []
         self._state_content_cache = ""
+
+        self._load_from_file()
+
+    def _load_from_file(self) -> None:
+        if not self.filepath:
+            return
+        try:
+            import os
+            if os.path.exists(self.filepath):
+                with open(self.filepath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        loaded_entries = [
+                            MemoryEntry.model_validate(item) for item in data
+                        ]
+                        if len(loaded_entries) > self.max_entries:
+                            loaded_entries = loaded_entries[-self.max_entries:]
+                        self._entries = {
+                            (entry.category, entry.key): entry
+                            for entry in loaded_entries
+                        }
+                        self._rebuild_state_cache()
+        except Exception as e:
+            print(f"⚠️ 从记忆文件 {self.filepath} 加载失败: {e}")
+
+    def _save_to_file(self) -> None:
+        if not self.filepath:
+            return
+        try:
+            data = [entry.model_dump() for entry in self.entries]
+            with open(self.filepath, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"⚠️ 保存记忆到文件 {self.filepath} 失败: {e}")
 
     @property
     def entries(self) -> tuple[MemoryEntry, ...]:
@@ -317,6 +370,7 @@ class StructuredWorkingMemory:
         self._entries = candidate
         self.state_version += 1
         self._rebuild_state_cache()
+        self._save_to_file()
         return tuple(applied)
 
     def flush_pending(self) -> bool:
@@ -341,7 +395,7 @@ class StructuredWorkingMemory:
         self.base_memory.add_turn(turn.user, turn.assistant)
         self._turn_index += 1
         self._pending_turns.append(turn)
-        if self.update_policy.should_extract(turn, len(self._pending_turns)):
+        if self.update_policy.should_extract(turn, self._pending_turns):
             self.flush_pending()
 
     def forget(self, category: str, key: str) -> bool:
@@ -374,3 +428,4 @@ class StructuredWorkingMemory:
         self.state_version = 0
         self.last_operations = ()
         self.last_extraction_error = None
+        self._save_to_file()

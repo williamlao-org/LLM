@@ -70,6 +70,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="启用门控批处理的结构化工作记忆",
     )
+    parser.add_argument(
+        "--structured-state-file",
+        type=str,
+        default=None,
+        help="结构化记忆的持久化存储文件路径（JSON格式）",
+    )
     return parser.parse_args(argv)
 
 
@@ -105,6 +111,7 @@ def build_memory(
         return StructuredWorkingMemory(
             base_memory=base_memory,
             extractor=state_extractor,
+            filepath=args.structured_state_file,
         )
     return base_memory
 

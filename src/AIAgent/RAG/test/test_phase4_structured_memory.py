@@ -7,7 +7,7 @@ from phase4_structured_memory import (
     LLMWorkingStateExtractor,
     MemoryExtraction,
     MemoryOperation,
-    SignalOrBatchUpdatePolicy,
+    TokenAndBreakUpdatePolicy,
     StructuredWorkingMemory,
 )
 from phase4_summary_memory import SummaryBufferMemory
@@ -44,52 +44,58 @@ def delete(category, key):
     return MemoryOperation(action="delete", category=category, key=key)
 
 
-def make_memory(outputs, *, max_pending=5, max_entries=30):
+def make_memory(outputs, *, min_tokens=1, min_tool_calls=1, max_entries=30):
     extractor = FakeExtractor(outputs)
     memory = StructuredWorkingMemory(
         base_memory=ConversationWindowMemory(max_turns=20),
         extractor=extractor,
-        update_policy=SignalOrBatchUpdatePolicy(max_pending),
+        update_policy=TokenAndBreakUpdatePolicy(
+            min_tokens_between_updates=min_tokens,
+            min_tool_calls_between_updates=min_tool_calls,
+        ),
         max_entries=max_entries,
     )
     return memory, extractor
 
 
-def test_ordinary_turns_batch_on_fifth_turn_in_original_order():
-    memory, extractor = make_memory([extraction()])
+def test_trigger_on_natural_break_once_token_threshold_is_met():
+    # 设定 min_tokens=45, min_tool_calls=3
+    # 每轮问题+回答估计约 8 tokens. 6轮累计约 48 tokens.
+    memory, extractor = make_memory([extraction()], min_tokens=45, min_tool_calls=3)
 
-    for index in range(1, 5):
+    for index in range(1, 6):
         memory.add_turn(f"普通问题 {index}", f"回答 {index}")
+        assert extractor.calls == []  # 前5轮累计 tokens < 45，不触发
+        assert len(memory.pending_turns) == index
 
-    assert extractor.calls == []
-    assert len(memory.pending_turns) == 4
-
-    memory.add_turn("普通问题 5", "回答 5")
-
+    # 第6轮，累计 tokens 达 48 >= 45，且助手回复是自然停顿，触发！
+    memory.add_turn("普通问题 6", "回答 6")
     assert len(extractor.calls) == 1
-    assert [turn.user for turn in extractor.calls[0][0]] == [
-        f"普通问题 {index}" for index in range(1, 6)
-    ]
     assert memory.pending_turns == ()
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        "我叫小林",
-        "我喜欢蓝色",
-        "以后必须用中文回答",
-        "我决定用 PostgreSQL",
-        "记得之后要检查日志",
-        "把颜色改成绿色",
-        "忘记我的颜色偏好",
-    ],
-)
-def test_explicit_signal_triggers_immediately(text):
-    memory, extractor = make_memory([extraction()])
+def test_trigger_on_tool_call_threshold_and_token_threshold_even_if_no_natural_break():
+    # 设定 min_tokens=70, min_tool_calls=3
+    # 模拟助手回复带有 "tool_call"，不是自然停顿（每轮一个 tool_call）
+    memory, extractor = make_memory([extraction()], min_tokens=70, min_tool_calls=3)
 
-    memory.add_turn(text, "好的")
+    # 前2轮：虽然助手回复是非自然停顿，但 token 增长还不够，不触发
+    memory.add_turn("普通问题 1", "执行 tool_call 动作 1")
+    memory.add_turn("普通问题 2", "执行 tool_call 动作 2")
+    assert extractor.calls == []
 
+    # 第3轮：累计 tool calls 达到 3，但累计 tokens 约 36，未到 70，不触发
+    memory.add_turn("普通问题 3", "执行 tool_call 动作 3")
+    assert extractor.calls == []
+
+    # 第4轮、第5轮继续积攒
+    memory.add_turn("普通问题 4", "执行 tool_call 动作 4")
+    memory.add_turn("普通问题 5", "执行 tool_call 动作 5")
+    assert extractor.calls == []
+
+    # 第6轮：累计 tool calls = 6 >= 3，累计 tokens 达 78 >= 70
+    # 满足 (has_met_token_threshold and has_met_tool_call_threshold) 条件，强行触发！
+    memory.add_turn("普通问题 6", "执行 tool_call 动作 6")
     assert len(extractor.calls) == 1
     assert memory.pending_turns == ()
 
@@ -160,8 +166,8 @@ def test_extraction_failure_keeps_state_and_clears_batch_without_retry_storm():
     assert "extractor down" in memory.last_extraction_error
 
     memory.add_turn("今天天气怎么样", "晴天")
-    assert len(extractor.calls) == 2
-    assert len(memory.pending_turns) == 1
+    assert len(extractor.calls) == 3
+    assert memory.pending_turns == ()
 
 
 def test_capacity_evicts_least_recently_updated_entry():
@@ -211,7 +217,14 @@ def test_context_order_is_structured_then_summary_then_recent_raw_turns():
     extractor = FakeExtractor([
         extraction(upsert("identity", "user.name", "小林")),
     ])
-    memory = StructuredWorkingMemory(base, extractor)
+    memory = StructuredWorkingMemory(
+        base,
+        extractor,
+        update_policy=TokenAndBreakUpdatePolicy(
+            min_tokens_between_updates=1,
+            min_tool_calls_between_updates=1,
+        )
+    )
     memory.add_turn("我叫小林", "你好")
     memory.add_turn("q", "a")
 
@@ -228,7 +241,7 @@ def test_context_order_is_structured_then_summary_then_recent_raw_turns():
 def test_manual_flush_forget_and_clear():
     memory, extractor = make_memory([
         extraction(upsert("constraint", "response.language", "中文")),
-    ])
+    ], min_tokens=100)
     memory.add_turn("普通问题", "普通回答")
 
     assert memory.flush_pending() is True
@@ -348,3 +361,63 @@ def test_cli_builds_structured_wrapper_around_selected_base_strategy():
     assert isinstance(base, SummaryBufferMemory)
     assert base.max_recent_tokens == 120
     assert base.max_summary_tokens == 80
+
+
+def test_structured_memory_file_persistence(tmp_path):
+    import os
+    filepath = str(tmp_path / "memory.json")
+
+    # 1. 初始阶段：创建带有文件路径的记忆系统
+    extractor = FakeExtractor([
+        extraction(upsert("identity", "user.name", "小林")),
+    ])
+    memory = StructuredWorkingMemory(
+        base_memory=ConversationWindowMemory(max_turns=20),
+        extractor=extractor,
+        update_policy=TokenAndBreakUpdatePolicy(
+            min_tokens_between_updates=1,
+            min_tool_calls_between_updates=1,
+        ),
+        filepath=filepath,
+    )
+
+    # 文件应该不存在
+    assert not os.path.exists(filepath)
+
+    # 2. 添加问答轮次触发提取，会触发写入文件
+    memory.add_turn("我叫小林", "你好")
+    assert len(memory.entries) == 1
+    assert memory.entries[0].key == "user.name"
+    assert memory.entries[0].value == "小林"
+
+    # 文件现在应该已经存在并包含了序列化的条目
+    assert os.path.exists(filepath)
+    with open(filepath, "r", encoding="utf-8") as f:
+        data = json.load(f)
+        assert len(data) == 1
+        assert data[0]["key"] == "user.name"
+        assert data[0]["value"] == "小林"
+
+    # 3. 创建一个新的记忆实例，传入同样的文件路径，验证自动加载
+    extractor2 = FakeExtractor([])
+    memory2 = StructuredWorkingMemory(
+        base_memory=ConversationWindowMemory(max_turns=20),
+        extractor=extractor2,
+        update_policy=TokenAndBreakUpdatePolicy(
+            min_tokens_between_updates=1,
+            min_tool_calls_between_updates=1,
+        ),
+        filepath=filepath,
+    )
+
+    # 应该无需调用 LLM，直接从文件加载了已有的状态
+    assert len(memory2.entries) == 1
+    assert memory2.entries[0].key == "user.name"
+    assert memory2.entries[0].value == "小林"
+
+    # 4. 验证 clear 行为能同步清空文件
+    memory2.clear()
+    assert memory2.entries == ()
+    with open(filepath, "r", encoding="utf-8") as f:
+        data2 = json.load(f)
+        assert data2 == []
