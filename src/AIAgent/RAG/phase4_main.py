@@ -6,8 +6,9 @@ Phase 4: 短期记忆交互实验。
     uv run python src/AIAgent/RAG/phase4_main.py --strategy tokens --token-budget 120
     uv run python src/AIAgent/RAG/phase4_main.py \
   --strategy summary \
+  --structured-state \
   --token-budget 1200 \
-  --summary-token-budget 800
+  --summary-token-budget 400
 """
 
 import argparse
@@ -19,6 +20,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import config
 from phase3_agentic_rag import AgenticRAG
 from phase3_main import ensure_index
+from phase4_structured_memory import (
+    LLMWorkingStateExtractor,
+    StructuredWorkingMemory,
+    WorkingStateExtractor,
+)
 from phase4_summary_memory import (
     ConversationSummarizer,
     LLMConversationSummarizer,
@@ -59,44 +65,69 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=400,
         help="summary 策略的滚动摘要预算（默认: 400）",
     )
+    parser.add_argument(
+        "--structured-state",
+        action="store_true",
+        help="启用门控批处理的结构化工作记忆",
+    )
     return parser.parse_args(argv)
 
 
 def build_memory(
     args: argparse.Namespace,
     summarizer: ConversationSummarizer | None = None,
+    state_extractor: WorkingStateExtractor | None = None,
     token_counter: TokenCounter | None = None,
     turn_token_counter: TurnTokenCounter | None = None,
 ) -> WorkingMemory:
     if args.strategy == "summary":
         if summarizer is None:
             raise ValueError("summary 策略需要 summarizer")
-        return SummaryBufferMemory(
+        base_memory: WorkingMemory = SummaryBufferMemory(
             max_recent_tokens=args.token_budget,
             max_summary_tokens=args.summary_token_budget,
             summarizer=summarizer,
             token_counter=token_counter,
             turn_token_counter=turn_token_counter,
         )
-    if args.strategy == "tokens":
-        return TokenBudgetMemory(
+    elif args.strategy == "tokens":
+        base_memory = TokenBudgetMemory(
             max_tokens=args.token_budget,
             token_counter=token_counter,
             turn_token_counter=turn_token_counter,
         )
-    return ConversationWindowMemory(max_turns=args.max_turns)
+    else:
+        base_memory = ConversationWindowMemory(max_turns=args.max_turns)
+
+    if args.structured_state:
+        if state_extractor is None:
+            raise ValueError("--structured-state 需要 state_extractor")
+        return StructuredWorkingMemory(
+            base_memory=base_memory,
+            extractor=state_extractor,
+        )
+    return base_memory
+
+
+def get_base_memory(memory: WorkingMemory) -> WorkingMemory:
+    if isinstance(memory, StructuredWorkingMemory):
+        return memory.base_memory
+    return memory
 
 
 def print_banner(memory: WorkingMemory) -> None:
-    if isinstance(memory, SummaryBufferMemory):
+    base_memory = get_base_memory(memory)
+    if isinstance(base_memory, SummaryBufferMemory):
         strategy = (
-            f"摘要缓冲（原文 {memory.max_recent_tokens} + "
-            f"摘要 {memory.max_summary_tokens} tokens）"
+            f"摘要缓冲（原文 {base_memory.max_recent_tokens} + "
+            f"摘要 {base_memory.max_summary_tokens} tokens）"
         )
-    elif isinstance(memory, TokenBudgetMemory):
-        strategy = f"Token 预算（{memory.max_tokens} tokens）"
+    elif isinstance(base_memory, TokenBudgetMemory):
+        strategy = f"Token 预算（{base_memory.max_tokens} tokens）"
     else:
-        strategy = f"轮数窗口（{memory.max_turns} 轮）"
+        strategy = f"轮数窗口（{base_memory.max_turns} 轮）"
+    if isinstance(memory, StructuredWorkingMemory):
+        strategy = "结构化状态 + " + strategy
 
     print(f"""
 ╔════════════════════════════════════════════════════════╗
@@ -117,7 +148,21 @@ def print_help(memory: WorkingMemory) -> None:
   /quit         → 退出
 """
 
-    if isinstance(memory, SummaryBufferMemory):
+    if isinstance(memory, StructuredWorkingMemory):
+        common += """  /state        → 查看结构化状态和 pending 批次
+  /extract      → 手动抽取尚未达到门槛的 pending 回合
+  /forget <category> <key> → 确定性删除一个条目
+"""
+
+    base_memory = get_base_memory(memory)
+    if isinstance(memory, StructuredWorkingMemory):
+        experiment = """
+💡 结构化工作记忆实验:
+  1. 说“我喜欢蓝色”，观察显式信号如何立即更新状态
+  2. 进行普通对话，观察每 5 轮的兜底批处理
+  3. 用 /state、/extract 和 /forget 检查门控与更新
+"""
+    elif isinstance(base_memory, SummaryBufferMemory):
         experiment = """
 💡 摘要缓冲实验:
   1. 用小 Token 预算启动，告诉 Agent 你的名字和偏好
@@ -136,35 +181,57 @@ def print_help(memory: WorkingMemory) -> None:
 
 
 def print_memory(memory: WorkingMemory) -> None:
-    if isinstance(memory, SummaryBufferMemory):
+    if isinstance(memory, StructuredWorkingMemory):
+        print_state(memory)
+    base_memory = get_base_memory(memory)
+
+    if isinstance(base_memory, SummaryBufferMemory):
         usage = (
-            f"{len(memory)} 轮近期原文，"
-            f"{memory.recent_tokens}/{memory.max_recent_tokens} DeepSeek V4 tokens；"
-            f"摘要 {memory.summary_tokens}/{memory.max_summary_tokens} "
+            f"{len(base_memory)} 轮近期原文，"
+            f"{base_memory.recent_tokens}/{base_memory.max_recent_tokens} "
+            "DeepSeek V4 tokens；"
+            f"摘要 {base_memory.summary_tokens}/{base_memory.max_summary_tokens} "
             "DeepSeek V4 tokens"
         )
-    elif isinstance(memory, TokenBudgetMemory):
+    elif isinstance(base_memory, TokenBudgetMemory):
         usage = (
-            f"{len(memory)} 轮，{memory.current_tokens}/{memory.max_tokens} "
+            f"{len(base_memory)} 轮，"
+            f"{base_memory.current_tokens}/{base_memory.max_tokens} "
             "DeepSeek V4 tokens"
         )
     else:
-        usage = f"{len(memory)}/{memory.max_turns} 轮"
+        usage = f"{len(base_memory)}/{base_memory.max_turns} 轮"
 
     print(f"\n🧠 当前记忆: {usage}")
-    if isinstance(memory, SummaryBufferMemory):
+    if isinstance(base_memory, SummaryBufferMemory):
         print("  📝 历史摘要:")
-        print(f"     {memory.summary or '（空）'}")
-        if memory.last_summary_error:
-            print(f"  ⚠️ 最近摘要失败: {memory.last_summary_error}")
+        print(f"     {base_memory.summary or '（空）'}")
+        if base_memory.last_summary_error:
+            print(f"  ⚠️ 最近摘要失败: {base_memory.last_summary_error}")
         print("  💬 近期原文:")
-    if not memory.turns:
+    if not base_memory.turns:
         print("  （空）")
         return
 
-    for index, turn in enumerate(memory.turns, 1):
+    for index, turn in enumerate(base_memory.turns, 1):
         print(f"  [{index}] 用户: {turn.user}")
         print(f"      助手: {turn.assistant}")
+
+
+def print_state(memory: StructuredWorkingMemory) -> None:
+    print(
+        f"\n📌 结构化状态: {len(memory.entries)}/{memory.max_entries} 项，"
+        f"pending={len(memory.pending_turns)}，version={memory.state_version}"
+    )
+    if not memory.entries:
+        print("  （空）")
+    for entry in memory.entries:
+        print(
+            f"  [{entry.category}] {entry.key} = {entry.value} "
+            f"(created={entry.created_turn}, updated={entry.updated_turn})"
+        )
+    if memory.last_extraction_error:
+        print(f"  ⚠️ 最近抽取失败: {memory.last_extraction_error}")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -188,9 +255,15 @@ def main(argv: list[str] | None = None) -> None:
             if args.strategy == "summary"
             else None
         )
+        state_extractor = (
+            LLMWorkingStateExtractor(agent.llm_client, agent.llm_model)
+            if args.structured_state
+            else None
+        )
         memory = build_memory(
             args,
             summarizer=summarizer,
+            state_extractor=state_extractor,
             token_counter=(
                 deepseek_counter.count_text if deepseek_counter else None
             ),
@@ -225,6 +298,41 @@ def main(argv: list[str] | None = None) -> None:
         if question == "/memory":
             print_memory(memory)
             continue
+        if question == "/state":
+            if isinstance(memory, StructuredWorkingMemory):
+                print_state(memory)
+            else:
+                print("未启用结构化工作记忆，请使用 --structured-state。")
+            continue
+        if question == "/extract":
+            if not isinstance(memory, StructuredWorkingMemory):
+                print("未启用结构化工作记忆，请使用 --structured-state。")
+                continue
+            previous_version = memory.state_version
+            if not memory.flush_pending():
+                print("没有待抽取的 pending 回合。")
+            elif memory.last_extraction_error:
+                print(f"⚠️ 抽取失败: {memory.last_extraction_error}")
+            elif memory.state_version == previous_version:
+                print("✅ 抽取完成，没有需要更新的结构化信息。")
+            else:
+                print("✅ 结构化状态已更新。")
+                print_state(memory)
+            continue
+        if question.startswith("/forget"):
+            if not isinstance(memory, StructuredWorkingMemory):
+                print("未启用结构化工作记忆，请使用 --structured-state。")
+                continue
+            parts = question.split(maxsplit=2)
+            if len(parts) != 3:
+                print("用法: /forget <category> <key>")
+                continue
+            try:
+                removed = memory.forget(parts[1], parts[2])
+                print("✅ 已删除。" if removed else "未找到匹配条目。")
+            except ValueError as error:
+                print(f"删除失败: {error}")
+            continue
         if question == "/clear":
             memory.clear()
             print("✅ 短期记忆已清空。")
@@ -234,27 +342,52 @@ def main(argv: list[str] | None = None) -> None:
             continue
 
         try:
+            structured_memory = (
+                memory if isinstance(memory, StructuredWorkingMemory) else None
+            )
+            base_memory = get_base_memory(memory)
             previous_summary = (
-                memory.summary
-                if isinstance(memory, SummaryBufferMemory)
+                base_memory.summary
+                if isinstance(base_memory, SummaryBufferMemory)
                 else None
             )
             previous_summary_error = (
-                memory.last_summary_error
-                if isinstance(memory, SummaryBufferMemory)
+                base_memory.last_summary_error
+                if isinstance(base_memory, SummaryBufferMemory)
+                else None
+            )
+            previous_state_version = (
+                structured_memory.state_version if structured_memory else None
+            )
+            previous_extraction_error = (
+                structured_memory.last_extraction_error
+                if structured_memory
                 else None
             )
             agent.query(question, verbose=True, memory=memory)
-            if isinstance(memory, SummaryBufferMemory):
-                if memory.summary != previous_summary:
-                    print(f"\n📝 历史摘要已更新:\n{memory.summary}")
+            if isinstance(base_memory, SummaryBufferMemory):
+                if base_memory.summary != previous_summary:
+                    print(f"\n📝 历史摘要已更新:\n{base_memory.summary}")
                 if (
-                    memory.last_summary_error
-                    and memory.last_summary_error != previous_summary_error
+                    base_memory.last_summary_error
+                    and base_memory.last_summary_error != previous_summary_error
                 ):
                     print(
                         "\n⚠️ 摘要失败，已保持上下文预算: "
-                        f"{memory.last_summary_error}"
+                        f"{base_memory.last_summary_error}"
+                    )
+            if structured_memory:
+                if structured_memory.state_version != previous_state_version:
+                    print("\n📌 结构化状态已更新:")
+                    print_state(structured_memory)
+                if (
+                    structured_memory.last_extraction_error
+                    and structured_memory.last_extraction_error
+                    != previous_extraction_error
+                ):
+                    print(
+                        "\n⚠️ 结构化抽取失败，主回答不受影响: "
+                        f"{structured_memory.last_extraction_error}"
                     )
         except Exception as error:
             print(f"\n❌ 查询出错: {error}")
