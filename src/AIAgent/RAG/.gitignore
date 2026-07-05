@@ -1,3 +1,7 @@
 # RAG runtime indexes
 simple_index.json
 chroma_db/
+
+# Phase 4 memory persistence
+episodic_memory.json
+structured_memory.json

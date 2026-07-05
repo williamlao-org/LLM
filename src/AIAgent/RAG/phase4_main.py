@@ -1,5 +1,5 @@
 """
-Phase 4: 短期记忆交互实验。
+Phase 4: 短期记忆 + 长期情景记忆交互实验。
 
 运行：
     uv run python src/AIAgent/RAG/phase4_main.py
@@ -7,6 +7,7 @@ Phase 4: 短期记忆交互实验。
     uv run python src/AIAgent/RAG/phase4_main.py \
   --strategy summary \
   --structured-state \
+  --episodic-memory-file episodic_memory.json \
   --token-budget 1200 \
   --summary-token-budget 400
 """
@@ -14,12 +15,31 @@ Phase 4: 短期记忆交互实验。
 import argparse
 import os
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _resolve_path(filepath: str | None) -> str | None:
+    """将相对路径解析为相对于脚本所在目录的绝对路径。"""
+    if filepath is None:
+        return None
+    p = Path(filepath)
+    if not p.is_absolute():
+        p = _SCRIPT_DIR / p
+    return str(p)
 
 from config import config
 from phase3_agentic_rag import AgenticRAG
 from phase3_main import ensure_index
+from phase4_episodic_memory import (
+    EpisodicAgent,
+    EpisodicMemory,
+    LLMEpisodeReflector,
+    RecalledEpisode,
+)
 from phase4_structured_memory import (
     LLMWorkingStateExtractor,
     StructuredWorkingMemory,
@@ -40,7 +60,7 @@ from phase4_working_memory import ConversationWindowMemory, WorkingMemory
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Phase 4 短期记忆实验")
+    parser = argparse.ArgumentParser(description="Phase 4 Agent 记忆实验")
     parser.add_argument(
         "--strategy",
         choices=("turns", "tokens", "summary"),
@@ -75,6 +95,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         default=None,
         help="结构化记忆的持久化存储文件路径（JSON格式）",
+    )
+    parser.add_argument(
+        "--episodic-memory-file",
+        type=str,
+        default=None,
+        help="启用情景记忆并指定 JSON 经验库路径",
+    )
+    parser.add_argument(
+        "--episodic-top-k",
+        type=int,
+        default=3,
+        help="每次召回的最大经验数（默认: 3）",
+    )
+    parser.add_argument(
+        "--episodic-min-score",
+        type=float,
+        default=0.35,
+        help="情景记忆最低余弦相似度（默认: 0.35）",
+    )
+    parser.add_argument(
+        "--episodic-max-episodes",
+        type=int,
+        default=200,
+        help="经验库最大条数（默认: 200）",
     )
     return parser.parse_args(argv)
 
@@ -111,7 +155,7 @@ def build_memory(
         return StructuredWorkingMemory(
             base_memory=base_memory,
             extractor=state_extractor,
-            filepath=args.structured_state_file,
+            filepath=_resolve_path(args.structured_state_file),
         )
     return base_memory
 
@@ -122,7 +166,10 @@ def get_base_memory(memory: WorkingMemory) -> WorkingMemory:
     return memory
 
 
-def print_banner(memory: WorkingMemory) -> None:
+def print_banner(
+    memory: WorkingMemory,
+    episodic_memory: EpisodicMemory | None = None,
+) -> None:
     base_memory = get_base_memory(memory)
     if isinstance(base_memory, SummaryBufferMemory):
         strategy = (
@@ -135,17 +182,22 @@ def print_banner(memory: WorkingMemory) -> None:
         strategy = f"轮数窗口（{base_memory.max_turns} 轮）"
     if isinstance(memory, StructuredWorkingMemory):
         strategy = "结构化状态 + " + strategy
+    if episodic_memory is not None:
+        strategy += f" + 情景记忆({len(episodic_memory)} 条)"
 
     print(f"""
 ╔════════════════════════════════════════════════════════╗
-║                 🧠 Phase 4：短期记忆                  ║
+║                 🧠 Phase 4：Agent 记忆                 ║
 ║                                                        ║
 ║   当前策略: {strategy:<41}║
 ╚════════════════════════════════════════════════════════╝
 """)
 
 
-def print_help(memory: WorkingMemory) -> None:
+def print_help(
+    memory: WorkingMemory,
+    episodic_memory: EpisodicMemory | None = None,
+) -> None:
     common = """
 📖 可用命令:
   直接输入问题  → 使用当前短期记忆继续对话
@@ -159,6 +211,13 @@ def print_help(memory: WorkingMemory) -> None:
         common += """  /state        → 查看结构化状态和 pending 批次
   /extract      → 手动抽取尚未达到门槛的 pending 回合
   /forget <category> <key> → 确定性删除一个条目
+"""
+
+    if episodic_memory is not None:
+        common += """  /episodes     → 查看已持久化的历史经验
+  /recall <query> → 手动召回相似经验
+  /forget-episode <id> → 删除指定经验
+  /clear-episodes → 清空长期情景记忆
 """
 
     base_memory = get_base_memory(memory)
@@ -185,6 +244,35 @@ def print_help(memory: WorkingMemory) -> None:
   3. 再进行几轮无关对话，用 /memory 观察最早信息被淘汰
 """
     print(common + experiment)
+
+
+def print_recalled(recalled: tuple[RecalledEpisode, ...]) -> None:
+    if not recalled:
+        print("  （没有达到相似度门槛的历史经验）")
+        return
+    for index, item in enumerate(recalled, 1):
+        episode = item.episode
+        print(
+            f"  [{index}] score={item.score:.4f} "
+            f"id={episode.id} outcome={episode.outcome}"
+        )
+        print(f"      任务: {episode.task}")
+        print(f"      反思: {episode.reflection.summary}")
+
+
+def print_episodes(memory: EpisodicMemory) -> None:
+    print(f"\n📚 情景记忆: {len(memory)}/{memory.max_episodes} 条")
+    if not memory.episodes:
+        print("  （空）")
+    for index, episode in enumerate(reversed(memory.episodes), 1):
+        print(
+            f"  [{index}] {episode.created_at} "
+            f"id={episode.id} outcome={episode.outcome}"
+        )
+        print(f"      任务: {episode.task}")
+        print(f"      经验: {episode.reflection.summary}")
+    if memory.last_load_error:
+        print(f"  ⚠️ 经验库加载失败: {memory.last_load_error}")
 
 
 def print_memory(memory: WorkingMemory) -> None:
@@ -278,14 +366,29 @@ def main(argv: list[str] | None = None) -> None:
                 deepseek_counter.count_turn if deepseek_counter else None
             ),
         )
-        print_banner(memory)
+        episodic_memory = None
+        query_agent = agent
+        if args.episodic_memory_file:
+            episodic_memory = EpisodicMemory(
+                filepath=_resolve_path(args.episodic_memory_file),
+                embedder=agent.embedder,
+                reflector=LLMEpisodeReflector(
+                    agent.llm_client,
+                    agent.llm_model,
+                ),
+                top_k=args.episodic_top_k,
+                min_similarity=args.episodic_min_score,
+                max_episodes=args.episodic_max_episodes,
+            )
+            query_agent = EpisodicAgent(agent, episodic_memory)
+        print_banner(memory, episodic_memory)
         if not ensure_index(agent):
             return
     except Exception as error:
         print(f"❌ 初始化失败: {error}")
         return
 
-    print_help(memory)
+    print_help(memory, episodic_memory)
 
     while True:
         try:
@@ -300,7 +403,7 @@ def main(argv: list[str] | None = None) -> None:
             print("👋 再见！")
             break
         if question == "/help":
-            print_help(memory)
+            print_help(memory, episodic_memory)
             continue
         if question == "/memory":
             print_memory(memory)
@@ -310,6 +413,44 @@ def main(argv: list[str] | None = None) -> None:
                 print_state(memory)
             else:
                 print("未启用结构化工作记忆，请使用 --structured-state。")
+            continue
+        if question == "/episodes":
+            if episodic_memory is None:
+                print("未启用情景记忆，请使用 --episodic-memory-file。")
+            else:
+                print_episodes(episodic_memory)
+            continue
+        if question.startswith("/recall"):
+            if episodic_memory is None:
+                print("未启用情景记忆，请使用 --episodic-memory-file。")
+                continue
+            parts = question.split(maxsplit=1)
+            if len(parts) != 2 or not parts[1].strip():
+                print("用法: /recall <query>")
+                continue
+            print("\n🔎 相似历史经验:")
+            print_recalled(episodic_memory.recall(parts[1]))
+            if episodic_memory.last_recall_error:
+                print(f"⚠️ 召回失败: {episodic_memory.last_recall_error}")
+            continue
+        if question.startswith("/forget-episode"):
+            if episodic_memory is None:
+                print("未启用情景记忆，请使用 --episodic-memory-file。")
+                continue
+            parts = question.split(maxsplit=1)
+            if len(parts) != 2 or not parts[1].strip():
+                print("用法: /forget-episode <id>")
+                continue
+            removed = episodic_memory.delete(parts[1].strip())
+            print("✅ 已删除。" if removed else "未找到匹配经验。")
+            continue
+        if question == "/clear-episodes":
+            if episodic_memory is None:
+                print("未启用情景记忆，请使用 --episodic-memory-file。")
+            elif episodic_memory.clear():
+                print("✅ 长期情景记忆已清空。")
+            else:
+                print(f"⚠️ 清空失败: {episodic_memory.last_recording_error}")
             continue
         if question == "/extract":
             if not isinstance(memory, StructuredWorkingMemory):
@@ -371,7 +512,30 @@ def main(argv: list[str] | None = None) -> None:
                 if structured_memory
                 else None
             )
-            agent.query(question, verbose=True, memory=memory)
+            previous_episode_count = (
+                len(episodic_memory) if episodic_memory is not None else None
+            )
+            query_agent.query(question, verbose=True, memory=memory)
+            if episodic_memory is not None:
+                if isinstance(query_agent, EpisodicAgent) and query_agent.last_recalled:
+                    print("\n🧠 本轮已召回的历史经验:")
+                    print_recalled(query_agent.last_recalled)
+                if len(episodic_memory) != previous_episode_count:
+                    newest = episodic_memory.episodes[-1]
+                    print(
+                        "\n💾 已记录任务经验: "
+                        f"id={newest.id} outcome={newest.outcome}"
+                    )
+                if episodic_memory.last_reflection_error:
+                    print(
+                        "\n⚠️ 自动反思失败，已使用降级记录: "
+                        f"{episodic_memory.last_reflection_error}"
+                    )
+                if episodic_memory.last_recording_error:
+                    print(
+                        "\n⚠️ 情景记忆写入失败，主回答不受影响: "
+                        f"{episodic_memory.last_recording_error}"
+                    )
             if isinstance(base_memory, SummaryBufferMemory):
                 if base_memory.summary != previous_summary:
                     print(f"\n📝 历史摘要已更新:\n{base_memory.summary}")
