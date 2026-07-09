@@ -6,6 +6,7 @@ from typing import Any, Callable, Literal, Protocol
 
 from pydantic import BaseModel, Field, model_validator
 
+from phase4_memory_security import contains_sensitive_data
 from phase4_token_memory import estimate_text_tokens
 from phase4_working_memory import ConversationTurn, WorkingMemory
 
@@ -74,6 +75,19 @@ class WorkingStateExtractor(Protocol):
 class TokenAndBreakUpdatePolicy:
     """按 Token 增长与对话停顿触发记忆更新的策略（模仿 Claude Code）。"""
 
+    _EXPLICIT_MEMORY_SIGNAL = re.compile(
+        r"(请记住|记住我|帮我记|记我|别忘|忘记我|不要记|删除.{0,8}记忆|"
+        r"更正.{0,8}(我|信息|一下)|更新.{0,8}(我|偏好|信息)|"
+        r"搬到|换了.{0,4}(地址|地方|城市|住处)|"
+        r"以后.{0,12}(回答|使用|不要|都)|"
+        r"\bremember\b|\bforget\b|\bcorrect\s+(my|the)\b|"
+        r"\bupdate\s+my\b|"
+        r"\bupdate\b.{0,20}\b(preference|memory|profile)\b|"
+        r"\bmoved?\s+to\b|\brelocated?\b)",
+        re.IGNORECASE,
+    )
+
+
     def __init__(
         self,
         min_tokens_between_updates: int = 150,
@@ -95,6 +109,10 @@ class TokenAndBreakUpdatePolicy:
         newest_turn: ConversationTurn,
         pending_turns: list[ConversationTurn],
     ) -> bool:
+        # 明确的记住/忘记/更正请求必须在本轮成功后立即生效。
+        if self._EXPLICIT_MEMORY_SIGNAL.search(newest_turn.user):
+            return True
+
         # 计算当前 pending 队列中的总 Token 增长数
         total_new_tokens = sum(
             self.token_counter(t.user) + self.token_counter(t.assistant)
@@ -225,6 +243,7 @@ class StructuredWorkingMemory:
         update_policy: TokenAndBreakUpdatePolicy | None = None,
         max_entries: int = 30,
         filepath: str | None = None,
+        semantic_sink: Any | None = None,
     ):
         if max_entries <= 0:
             raise ValueError("max_entries 必须大于 0")
@@ -233,6 +252,7 @@ class StructuredWorkingMemory:
         self.update_policy = update_policy or TokenAndBreakUpdatePolicy()
         self.max_entries = max_entries
         self.filepath = filepath
+        self.semantic_sink = semantic_sink
 
         self.last_extraction_error: str | None = None
         self.last_operations: tuple[MemoryOperation, ...] = ()
@@ -255,6 +275,12 @@ class StructuredWorkingMemory:
                     if isinstance(data, list):
                         loaded_entries = [
                             MemoryEntry.model_validate(item) for item in data
+                        ]
+                        loaded_entries = [
+                            entry for entry in loaded_entries
+                            if not contains_sensitive_data(
+                                f"{entry.key} {entry.value}"
+                            )
                         ]
                         if len(loaded_entries) > self.max_entries:
                             loaded_entries = loaded_entries[-self.max_entries:]
@@ -297,7 +323,10 @@ class StructuredWorkingMemory:
     @classmethod
     def _is_sensitive(cls, operation: MemoryOperation) -> bool:
         text = f"{operation.key} {operation.value or ''}"
-        return bool(cls._SENSITIVE_PATTERN.search(text))
+        return (
+            bool(cls._SENSITIVE_PATTERN.search(text))
+            or contains_sensitive_data(text)
+        )
 
     def _rebuild_state_cache(self) -> None:
         payload = {
@@ -327,9 +356,29 @@ class StructuredWorkingMemory:
         candidate = dict(self._entries)
         applied: list[MemoryOperation] = []
 
-        for operation in operations:
-            if self._is_sensitive(operation):
+        safe_operations = [
+            operation for operation in operations
+            if not self._is_sensitive(operation)
+        ]
+        for operation in safe_operations:
+            if operation.category == "fact" and self.semantic_sink is not None:
+                from phase4_semantic_memory import SemanticOperation
+                sem_op = SemanticOperation(
+                    action=operation.action,
+                    category="fact",
+                    key=operation.key,
+                    value=operation.value,
+                )
+                res = self.semantic_sink.apply_operations([sem_op])
+                index = (operation.category, operation.key)
+                evicted = False
+                if index in candidate:
+                    candidate.pop(index)
+                    evicted = True
+                if res or evicted:
+                    applied.append(operation)
                 continue
+
             index = (operation.category, operation.key)
             if operation.action == "delete":
                 if index in candidate:
@@ -381,7 +430,8 @@ class StructuredWorkingMemory:
         self._pending_turns.clear()
 
         try:
-            extraction = self.extractor.extract(batch, self.entries)
+            extraction_entries = self.entries
+            extraction = self.extractor.extract(batch, extraction_entries)
             self.last_operations = self._apply_operations(extraction.operations)
             self.last_extraction_error = None
         except Exception as error:
@@ -407,7 +457,8 @@ class StructuredWorkingMemory:
             )
         except Exception as error:
             raise ValueError(f"无效的 category/key: {error}") from error
-        return bool(self._apply_operations([operation]))
+        active_operations = self._apply_operations([operation])
+        return bool(active_operations)
 
     def get_context_messages(self) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = []

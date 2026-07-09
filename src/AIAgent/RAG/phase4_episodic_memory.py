@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import json
-import math
 import os
-import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +13,11 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 from phase1_embedder import cosine_similarity
+from phase4_memory_security import (
+    redact_sensitive_text,
+    sanitize_json as _sanitize_json,
+    validate_vector as _validate_vector,
+)
 from phase4_working_memory import ConversationTurn, WorkingMemory
 
 
@@ -155,75 +158,6 @@ class LLMEpisodeReflector:
             return EpisodeReflection.model_validate(json.loads(raw))
         except Exception as exception:
             raise ValueError(f"无法解析情景反思: {exception}") from exception
-
-
-_SECRET_ASSIGNMENT = re.compile(
-    r"(?i)(api[_. -]?key|password|passwd|access[_. -]?token|"
-    r"refresh[_. -]?token|private[_. -]?key|密码|令牌|私钥)"
-    r"(\s*[:=是为]\s*|\s+)([^\s,;，；]+)"
-)
-_BEARER_TOKEN = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
-_OPENAI_STYLE_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
-_PRIVATE_KEY_BLOCK = re.compile(
-    r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----",
-    re.DOTALL,
-)
-
-
-def redact_sensitive_text(value: str) -> str:
-    """对即将发送给反思器或写入磁盘的文本做确定性脱敏。"""
-
-    text = _PRIVATE_KEY_BLOCK.sub("[REDACTED PRIVATE KEY]", str(value))
-    text = _BEARER_TOKEN.sub("Bearer [REDACTED]", text)
-    text = _OPENAI_STYLE_KEY.sub("[REDACTED]", text)
-    return _SECRET_ASSIGNMENT.sub(
-        lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]",
-        text,
-    )
-
-
-def _sanitize_json(value: Any, *, max_string_length: int = 500) -> Any:
-    if isinstance(value, str):
-        return redact_sensitive_text(value)[:max_string_length]
-    if value is None or isinstance(value, (bool, int)):
-        return value
-    if isinstance(value, float):
-        return value if math.isfinite(value) else str(value)
-    if isinstance(value, dict):
-        sanitized: dict[str, Any] = {}
-        for key, item in list(value.items())[:50]:
-            clean_key = str(key)[:100]
-            if re.search(
-                r"(?i)(api.?key|password|passwd|token|private.?key|密码|令牌|私钥)",
-                clean_key,
-            ):
-                sanitized[clean_key] = "[REDACTED]"
-            else:
-                sanitized[clean_key] = _sanitize_json(
-                    item,
-                    max_string_length=max_string_length,
-                )
-        return sanitized
-    if isinstance(value, (list, tuple)):
-        return [
-            _sanitize_json(item, max_string_length=max_string_length)
-            for item in list(value)[:50]
-        ]
-    return redact_sensitive_text(str(value))[:max_string_length]
-
-
-def _validate_vector(vector: Any) -> list[float]:
-    if not isinstance(vector, list) or not vector:
-        raise ValueError("embedding 必须是非空浮点数组")
-    clean: list[float] = []
-    for value in vector:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise TypeError("embedding 只能包含数值")
-        number = float(value)
-        if not math.isfinite(number):
-            raise ValueError("embedding 不能包含 NaN 或无穷大")
-        clean.append(number)
-    return clean
 
 
 class EpisodicMemory:

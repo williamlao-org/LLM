@@ -91,7 +91,7 @@ uv run python src/AIAgent/RAG/phase4_main.py \
 
 当前 CLI 在门控触发后同步执行抽取，便于学习、观察和确定性测试。在在线服务中，可以保留 `WorkingStateExtractor` 接口，把同一批操作放到队列或后台 write-behind worker 中执行。
 
-这一层仍然是会话内工作记忆，不持久化。后续 [Phase 4.5](phase4_05_episodic_memory.md) 会记录任务经验，并在新任务开始时检索相似历史。
+这一层仍然是线程级工作记忆；不指定 `--structured-state-file` 时只存在于进程内，指定后可作为线程 checkpoint 跨进程恢复。它不等于按相关性检索的长期语义库；后续 [Phase 4.6](phase4_06_semantic_memory.md) 会把 `fact` 路由到独立存储，并在需要时召回。
 
 ## 7. 架构定位
 
@@ -113,5 +113,5 @@ uv run python src/AIAgent/RAG/phase4_main.py \
   * `StructuredWorkingMemory` 👈 **当前模块**（结构化关键信息提取与缓存优化，用短期的容器，承载并实验长期的内容）
 * **情景记忆 (Episodic Memory) —— 负责“回忆过去的任务执行经验”**
   * `EpisodicMemory` 将脱敏执行日志与反思连同向量索引存入磁盘，提供 few-shot 经验召回。
-* **语义记忆 (Semantic Memory) —— 负责“持久化的用户画像”**
-  * （已初步实现文件级持久化）将当前模块内存中的 KV 条目持久化写入 JSON 文件。未来可进一步扩展，将其保存至 SQLite 或向量数据库，以满足大规模多模态、跨会话和跨设备的永久记忆检索保留。
+* **语义记忆 (Semantic Memory) —— 负责“持久化并按需激活的稳定事实”**
+  * `SemanticMemory` 将 `fact` 保存到版本化 JSON 和向量索引中；自动召回或 `search_semantic_memory` 工具只把本轮相关事实追加到 Prompt 尾部。

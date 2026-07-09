@@ -49,6 +49,7 @@ Phase 3 的 Agentic RAG 把检索变成 Agent 的「工具」：
 
 import json
 from pathlib import Path
+from typing import Any, Callable
 from openai import OpenAI
 
 from phase1_embedder import APIEmbedder
@@ -76,6 +77,7 @@ AGENT_SYSTEM_PROMPT = """你是一个智能知识库问答助手，拥有检索�
 - **search_knowledge_base**: 在知识库中检索相关信息
 {multi_hop_tool}
 - **direct_answer**: 当你确信不需要检索就能回答时使用
+{external_tools}
 
 ## 工作流程
 对于每个用户问题，按以下逻辑决策：
@@ -98,7 +100,8 @@ AGENT_SYSTEM_PROMPT = """你是一个智能知识库问答助手，拥有检索�
 - 每轮只选择一个最合适的工具
 - 系统最多允许 {max_tool_calls} 次 Agent 工具调用、{max_retrieval_retries} 次额外检索重试
 - 达到重试上限后，用现有结果尽力回答并明确说明不足
-- 回答要清晰、准确、有条理"""
+- 回答要清晰、准确、有条理
+{memory_instruction}"""
 
 
 # ========== Function Calling 工具定义 ==========
@@ -201,6 +204,10 @@ class AgenticRAG:
         self.max_hop_retries = max_hop_retries
         self.max_replans = max_replans
         self.max_multi_hop_steps = max_multi_hop_steps
+        self._external_tools: dict[
+            str,
+            tuple[dict[str, Any], Callable[[dict[str, Any], bool], str], str],
+        ] = {}
 
         if self.top_k <= 0:
             raise ValueError("top_k 必须大于 0")
@@ -274,11 +281,41 @@ class AgenticRAG:
         disabled = set()
         if not self.use_multi_hop:
             disabled.add("multi_hop_search")
-        return [
+        builtins = [
             tool
             for tool in TOOLS
             if tool["function"]["name"] not in disabled
         ]
+        external = [
+            registration[0]
+            for registration in getattr(self, "_external_tools", {}).values()
+        ]
+        return [*builtins, *external]
+
+    def register_tool(
+        self,
+        spec: dict[str, Any],
+        handler: Callable[[dict[str, Any], bool], str],
+        prompt_instruction: str = "",
+    ) -> None:
+        """Register a deterministic external function tool before querying."""
+
+        try:
+            name = str(spec["function"]["name"]).strip()
+        except (KeyError, TypeError) as error:
+            raise ValueError("工具 spec 缺少 function.name") from error
+        if not name:
+            raise ValueError("工具名称不能为空")
+        builtin_names = {tool["function"]["name"] for tool in TOOLS}
+        external_tools = getattr(self, "_external_tools", None)
+        if external_tools is None:
+            external_tools = {}
+            self._external_tools = external_tools
+        if name in builtin_names or name in external_tools:
+            raise ValueError(f"工具名称重复: {name}")
+        if not callable(handler):
+            raise TypeError("工具 handler 必须可调用")
+        external_tools[name] = (spec, handler, prompt_instruction.strip())
 
     def _system_prompt(self) -> str:
         """让 Prompt 与功能开关和代码级限制保持一致。"""
@@ -294,11 +331,40 @@ class AgenticRAG:
             multi_hop_tool = ""
             multi_hop_rule = ""
 
+        external_instructions = [
+            instruction
+            for _, _, instruction in getattr(self, "_external_tools", {}).values()
+            if instruction
+        ]
+
+        has_memory = "search_semantic_memory" in getattr(
+            self, "_external_tools", {},
+        )
+        if has_memory:
+            memory_instruction = (
+                "\n## \u957f\u671f\u8bb0\u5fc6\n"
+                "\u7cfb\u7edf\u4f1a\u5728\u4f60\u56de\u7b54\u540e\uff0c\u81ea\u52a8\u5c06\u7528\u6237\u660e\u786e\u8868\u8fbe\u7684\u4e8b\u5b9e"
+                "\uff08\u5982\u59d3\u540d\u3001\u5c45\u4f4f\u5730\u3001\u504f\u597d\u7b49\uff09\u63d0\u53d6\u5e76\u6301\u4e45\u5316\u5230\u957f\u671f\u8bb0\u5fc6\u3002\n"
+                "\u4f60\u4e0d\u9700\u8981\u544a\u8bc9\u7528\u6237\u201c\u6211\u65e0\u6cd5\u6301\u4e45\u5316\u201d\u6216\u201c\u4ec5\u5728\u672c\u6b21\u5bf9\u8bdd\u4e2d\u8bb0\u4f4f\u201d\u3002\n"
+                "\u5f53\u7528\u6237\u8981\u6c42\u8bb0\u4f4f\u6216\u66f4\u65b0\u4e2a\u4eba\u4fe1\u606f\u65f6\uff0c\u4f60\u53ea\u9700\u6b63\u5e38\u786e\u8ba4\u5373\u53ef\uff0c"
+                "\u7cfb\u7edf\u4f1a\u81ea\u52a8\u5904\u7406\u6301\u4e45\u5316\u3002\n"
+                "\u5982\u679c\u81ea\u52a8\u53ec\u56de\u7684\u957f\u671f\u4e8b\u5b9e\u4e2d\u5df2\u6709\u65e7\u503c\uff0c"
+                "\u4f60\u53ef\u4ee5\u544a\u77e5\u7528\u6237\u201c\u6211\u4f1a\u5e2e\u4f60\u66f4\u65b0\u8fd9\u4e2a\u4fe1\u606f\u201d\u3002"
+            )
+        else:
+            memory_instruction = ""
+
         return AGENT_SYSTEM_PROMPT.format(
             multi_hop_tool=multi_hop_tool,
             multi_hop_rule=multi_hop_rule,
+            external_tools=(
+                "\n" + "\n".join(external_instructions)
+                if external_instructions
+                else ""
+            ),
             max_tool_calls=self.max_tool_calls,
             max_retrieval_retries=self.max_retrieval_retries,
+            memory_instruction=memory_instruction,
         )
 
     # ========== 知识库构建 ==========
@@ -1407,6 +1473,20 @@ class AgenticRAG:
                         "tool": fn_name,
                         "args": fn_args,
                         "result_preview": direct[:200],
+                    })
+                elif fn_name in getattr(self, "_external_tools", {}):
+                    _, handler, _ = self._external_tools[fn_name]
+                    try:
+                        result = str(handler(fn_args, verbose))
+                    except Exception as exception:
+                        result = (
+                            f"外部工具 {fn_name} 执行失败: "
+                            f"{type(exception).__name__}: {exception}"
+                        )
+                    steps.append({
+                        "tool": fn_name,
+                        "args": fn_args,
+                        "result_preview": result[:200],
                     })
                 else:
                     result = f"未知工具: {fn_name}"
