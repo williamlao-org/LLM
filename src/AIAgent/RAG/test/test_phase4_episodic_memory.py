@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -86,7 +87,7 @@ def test_record_creates_versioned_json_and_loads_across_instances(tmp_path):
 
     assert episode is not None
     payload = json.loads((tmp_path / "episodes.json").read_text("utf-8"))
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert "完整答案不应持久化" not in json.dumps(payload, ensure_ascii=False)
 
     loaded = EpisodicMemory(
@@ -342,6 +343,7 @@ def test_cli_exposes_episodic_defaults():
     assert args.episodic_top_k == 3
     assert args.episodic_min_score == 0.35
     assert args.episodic_max_episodes == 200
+    assert args.episodic_retention_days == 30
 
 
 def test_agent_does_not_record_when_no_steps(tmp_path):
@@ -361,3 +363,87 @@ def test_agent_does_not_record_when_no_steps(tmp_path):
     assert result["answer"] == "answer"
     assert len(episodic_memory.episodes) == 0
 
+
+def test_v1_episodic_memory_loads_with_forgetting_defaults(tmp_path):
+    path = tmp_path / "episodes.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "episodes": [{
+            "id": "old",
+            "task": "旧任务",
+            "outcome": "success",
+            "reflection": reflection().model_dump(),
+            "steps": [],
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "embedding": [1.0, 0.0],
+        }],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    memory = EpisodicMemory(path, FakeEmbedder(), FakeReflector())
+
+    assert memory.episodes[0].importance == 0.5
+    assert memory.episodes[0].recall_count == 0
+    assert memory.episodes[0].last_recalled_at is None
+
+
+def test_episodic_prune_and_recall_access_statistics(tmp_path):
+    memory = make_memory(tmp_path, min_similarity=-1.0)
+    normal = memory.record("普通任务", result={})
+    failed = memory.record("失败任务", result={}, error=RuntimeError("failed"))
+    assert normal is not None and failed is not None
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    memory._episodes = [
+        normal.model_copy(update={
+            "created_at": start.isoformat(),
+            "importance": 0.5,
+        }),
+        failed.model_copy(update={
+            "created_at": start.isoformat(),
+            "recall_count": 5,
+        }),
+    ]
+
+    removed = memory.prune(start + timedelta(days=46))
+
+    assert [episode.task for episode in removed] == ["普通任务"]
+    assert memory.recall("失败")
+    assert memory.episodes[0].recall_count == 6
+    assert memory.episodes[0].last_recalled_at is not None
+    memory._episodes[0] = memory.episodes[0].model_copy(update={
+        "last_recalled_at": (start + timedelta(days=46)).isoformat(),
+    })
+    assert memory.prune(start + timedelta(days=149))[0].task == "失败任务"
+
+
+def test_episodic_recall_access_save_failure_keeps_retrieval_available(tmp_path):
+    memory = make_memory(tmp_path, min_similarity=-1.0)
+    assert memory.record("任务", result={})
+    before = memory.episodes
+    memory._save = lambda episodes: (_ for _ in ()).throw(OSError("disk full"))
+
+    assert memory.recall("任务")
+    assert memory.episodes == before
+    assert "disk full" in memory.last_access_error
+
+
+def test_episodic_record_auto_prunes_highest_forgetting_score(tmp_path):
+    memory = make_memory(tmp_path, max_episodes=2)
+    stale = memory.record("易忘任务", result={})
+    important = memory.record("重要任务", result={}, error=RuntimeError("失败"))
+    assert stale is not None and important is not None
+    now = datetime.now(timezone.utc)
+    memory._episodes = [
+        stale.model_copy(update={
+            "created_at": (now - timedelta(days=40)).isoformat(),
+            "importance": 0.0,
+        }),
+        important.model_copy(update={
+            "created_at": (now - timedelta(days=40)).isoformat(),
+            "importance": 0.9,
+        }),
+    ]
+
+    assert memory.record("新任务", result={})
+
+    assert [episode.task for episode in memory.episodes] == ["重要任务", "新任务"]
+    assert [episode.task for episode in memory.last_pruned] == ["易忘任务"]

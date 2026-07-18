@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -52,12 +53,13 @@ class FakeExtractor:
         return output
 
 
-def operation(action="upsert", key="user.city", value="上海"):
+def operation(action="upsert", key="user.city", value="上海", **kwargs):
     return SemanticOperation(
         action=action,
         category="fact",
         key=key,
         value=value,
+        **kwargs,
     )
 
 
@@ -84,7 +86,7 @@ def test_versioned_persistence_update_delete_and_clear(tmp_path):
     first = memory.entries[0]
 
     payload = json.loads((tmp_path / "semantic.json").read_text("utf-8"))
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["entries"][0]["value"] == "上海"
 
     assert memory.apply_operations([operation(value="纽约")])
@@ -365,6 +367,7 @@ def test_cli_exposes_semantic_defaults_without_structured_wrapper():
     assert args.semantic_top_k == 3
     assert args.semantic_min_score == 0.35
     assert args.semantic_max_entries == 500
+    assert args.semantic_retention_days == 90
     assert isinstance(memory, ConversationWindowMemory)
 
 
@@ -419,3 +422,87 @@ def test_structured_memory_evicts_legacy_fact_from_working_state(tmp_path):
     assert semantic.entries[0].value == "新地址"
     assert memory.entries == ()
 
+
+def test_v1_semantic_memory_loads_with_forgetting_defaults(tmp_path):
+    path = tmp_path / "semantic.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "entries": [{
+            "category": "fact",
+            "key": "user.city",
+            "value": "上海",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "embedding": [1.0, 0.0],
+        }],
+    }), encoding="utf-8")
+
+    memory = SemanticMemory(path, FakeEmbedder())
+
+    assert memory.entries[0].importance == 0.5
+    assert memory.entries[0].recall_count == 0
+    assert memory.entries[0].last_recalled_at is None
+    memory.apply_operations([operation(key="user.language", value="Python")])
+    payload = json.loads(path.read_text("utf-8"))
+    assert payload["schema_version"] == 2
+
+
+def test_semantic_prune_uses_importance_and_recall_count(tmp_path):
+    memory = make_semantic(tmp_path)
+    memory.apply_operations([
+        operation(key="fact.normal", value="普通",),
+        operation(key="fact.important", value="重要", importance=0.9),
+    ])
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    important, normal = memory.entries
+    memory._entries[("fact", "fact.normal")] = normal.model_copy(update={
+        "updated_at": start.isoformat(),
+    })
+    memory._entries[("fact", "fact.important")] = important.model_copy(update={
+        "updated_at": start.isoformat(),
+        "recall_count": 5,
+    })
+
+    removed = memory.prune(start + timedelta(days=136))
+
+    assert [entry.key for entry in removed] == ["fact.normal"]
+    assert [entry.key for entry in memory.entries] == ["fact.important"]
+    assert memory.prune(start + timedelta(days=343))[0].key == "fact.important"
+
+
+def test_semantic_recall_persists_access_but_degrades_on_save_failure(tmp_path):
+    memory = make_semantic(tmp_path, min_similarity=-1.0)
+    memory.apply_operations([operation()])
+
+    assert memory.recall("上海")
+    assert memory.entries[0].recall_count == 1
+    assert memory.entries[0].last_recalled_at is not None
+
+    before = memory.entries
+    memory._save = lambda entries: (_ for _ in ()).throw(OSError("disk full"))
+    assert memory.recall("上海")
+    assert memory.entries == before
+    assert "disk full" in memory.last_access_error
+
+
+def test_semantic_write_auto_prunes_expired_and_highest_score_on_capacity(tmp_path):
+    memory = make_semantic(tmp_path, max_entries=2)
+    memory.apply_operations([
+        operation(key="fact.stale", value="旧", importance=0.0),
+        operation(key="fact.important", value="保留", importance=0.9),
+    ])
+    now = datetime.now(timezone.utc)
+    stale, important = memory.entries
+    memory._entries[("fact", "fact.stale")] = stale.model_copy(update={
+        "updated_at": (now - timedelta(days=80)).isoformat(),
+    })
+    memory._entries[("fact", "fact.important")] = important.model_copy(update={
+        "updated_at": (now - timedelta(days=80)).isoformat(),
+    })
+
+    memory.apply_operations([operation(key="fact.new", value="新")])
+
+    assert [entry.key for entry in memory.entries] == [
+        "fact.important", "fact.new",
+    ]
+    assert [entry.key for entry in memory.last_pruned] == ["fact.stale"]

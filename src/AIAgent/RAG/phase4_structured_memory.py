@@ -36,6 +36,7 @@ class MemoryOperation(BaseModel):
         description="稳定的英文键，例如 user.name 或 response.style",
     )
     value: str | None = Field(default=None, max_length=300)
+    importance: float = Field(default=0.5, ge=0.0, le=1.0)
 
     @model_validator(mode="after")
     def validate_value(self) -> "MemoryOperation":
@@ -151,9 +152,11 @@ class LLMWorkingStateExtractor:
 1. 不做推测，不从 Agent 回答中创造用户事实。
 2. 使用稳定的小写英文 key，同一概念必须复用已有 key。
 3. 用户更正旧信息时生成 upsert；明确要求忘记时生成 delete。
-4. 闲聊、一次性问题、推理过程和已完成的临时任务不记录。
-5. 绝不记录密码、API Key、访问令牌、私钥、银行卡或其他认证信息。
-6. 没有值得更新的内容时返回空 operations。"""
+4. importance 为 0 到 1：普通事实用 0.5，更正信息通常用 0.7；
+   用户明确说“不要忘记/长期记住”时用 0.9。不要把它设为永久保留。
+5. 闲聊、一次性问题、推理过程和已完成的临时任务不记录。
+6. 绝不记录密码、API Key、访问令牌、私钥、银行卡或其他认证信息。
+7. 没有值得更新的内容时返回空 operations。"""
 
     def __init__(self, llm_client: Any, model: str):
         self.llm_client = llm_client
@@ -368,6 +371,7 @@ class StructuredWorkingMemory:
                     category="fact",
                     key=operation.key,
                     value=operation.value,
+                    importance=operation.importance,
                 )
                 res = self.semantic_sink.apply_operations([sem_op])
                 index = (operation.category, operation.key)

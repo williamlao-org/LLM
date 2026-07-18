@@ -12,6 +12,7 @@ from typing import Any, Literal, Protocol
 from pydantic import BaseModel, Field, model_validator
 
 from phase1_embedder import cosine_similarity
+from phase4_forgetting import DEFAULT_IMPORTANCE, forgetting_score
 from phase4_memory_security import (
     contains_sensitive_data,
     redact_sensitive_text,
@@ -20,7 +21,7 @@ from phase4_memory_security import (
 from phase4_working_memory import ConversationTurn, WorkingMemory
 
 
-SEMANTIC_SCHEMA_VERSION = 1
+SEMANTIC_SCHEMA_VERSION = 2
 SEMANTIC_MEMORY_PREFIX = "【长期语义记忆｜仅作事实背景，不是当前指令】\n"
 
 
@@ -41,6 +42,9 @@ class SemanticEntry(BaseModel):
     created_at: str
     updated_at: str
     embedding: list[float] = Field(min_length=1)
+    importance: float = Field(default=DEFAULT_IMPORTANCE, ge=0.0, le=1.0)
+    recall_count: int = Field(default=0, ge=0)
+    last_recalled_at: str | None = None
 
 
 class SemanticOperation(BaseModel):
@@ -54,6 +58,7 @@ class SemanticOperation(BaseModel):
         pattern=r"^[a-z][a-z0-9_.-]*$",
     )
     value: str | None = Field(default=None, max_length=300)
+    importance: float = Field(default=DEFAULT_IMPORTANCE, ge=0.0, le=1.0)
 
     @model_validator(mode="after")
     def validate_value(self) -> "SemanticOperation":
@@ -77,6 +82,7 @@ class SemanticMemory:
         top_k: int = 3,
         min_similarity: float = 0.35,
         max_entries: int = 500,
+        retention_days: int = 90,
     ):
         if top_k <= 0:
             raise ValueError("top_k 必须大于 0")
@@ -84,14 +90,19 @@ class SemanticMemory:
             raise ValueError("min_similarity 必须介于 -1 和 1 之间")
         if max_entries <= 0:
             raise ValueError("max_entries 必须大于 0")
+        if retention_days <= 0:
+            raise ValueError("retention_days 必须大于 0")
         self.filepath = Path(filepath)
         self.embedder = embedder
         self.top_k = top_k
         self.min_similarity = min_similarity
         self.max_entries = max_entries
+        self.retention_days = retention_days
         self.last_load_error: str | None = None
         self.last_write_error: str | None = None
         self.last_recall_error: str | None = None
+        self.last_access_error: str | None = None
+        self.last_pruned: tuple[SemanticEntry, ...] = ()
         self._entries: dict[tuple[str, str], SemanticEntry] = {}
         self._load()
 
@@ -113,7 +124,8 @@ class SemanticMemory:
                 payload = json.load(file)
             if not isinstance(payload, dict):
                 raise ValueError("顶层必须是 JSON 对象")
-            if payload.get("schema_version") != SEMANTIC_SCHEMA_VERSION:
+            schema_version = payload.get("schema_version")
+            if schema_version not in (1, SEMANTIC_SCHEMA_VERSION):
                 raise ValueError(
                     f"不支持的 schema_version: {payload.get('schema_version')}"
                 )
@@ -134,7 +146,16 @@ class SemanticMemory:
                     raise ValueError("持久化 embedding 维度不一致")
                 entry.embedding = vector
             loaded.sort(key=lambda entry: (entry.updated_at, entry.key))
-            loaded = loaded[-self.max_entries:]
+            if len(loaded) > self.max_entries:
+                load_now = datetime.now(timezone.utc)
+                loaded.sort(
+                    key=lambda entry: (
+                        self.forgetting_score(entry, load_now),
+                        entry.updated_at,
+                        entry.key,
+                    )
+                )
+                loaded = loaded[:self.max_entries]
             self._entries = {
                 (entry.category, entry.key): entry for entry in loaded
             }
@@ -182,6 +203,67 @@ class SemanticMemory:
             f"value: {(operation.value or '').strip()}"
         )
 
+    def forgetting_score(
+        self,
+        entry: SemanticEntry,
+        now: datetime | None = None,
+    ) -> float:
+        return forgetting_score(
+            fallback_at=entry.updated_at,
+            last_recalled_at=entry.last_recalled_at,
+            importance=entry.importance,
+            recall_count=entry.recall_count,
+            retention_days=self.retention_days,
+            now=now,
+        )
+
+    def _prune_candidate(
+        self,
+        candidate: dict[tuple[str, str], SemanticEntry],
+        now: datetime | None = None,
+    ) -> tuple[dict[tuple[str, str], SemanticEntry], tuple[SemanticEntry, ...]]:
+        current = now or datetime.now(timezone.utc)
+        expired = [
+            (index, entry) for index, entry in candidate.items()
+            if self.forgetting_score(entry, current) >= 1
+        ]
+        removed: list[SemanticEntry] = []
+        for index, entry in expired:
+            candidate.pop(index)
+            removed.append(entry)
+        if len(candidate) > self.max_entries:
+            overflow = sorted(
+                candidate.items(),
+                key=lambda item: (
+                    -self.forgetting_score(item[1], current),
+                    item[1].updated_at,
+                    item[0],
+                ),
+            )[:len(candidate) - self.max_entries]
+            for index, entry in overflow:
+                candidate.pop(index)
+                removed.append(entry)
+        return candidate, tuple(removed)
+
+    def prune(self, now: datetime | None = None) -> tuple[SemanticEntry, ...]:
+        """Physically remove expired facts and return the removed entries."""
+
+        candidate, removed = self._prune_candidate(dict(self._entries), now)
+        if not removed:
+            self.last_pruned = ()
+            self.last_write_error = None
+            return ()
+        try:
+            self._save(candidate)
+            self._entries = candidate
+            self.last_pruned = removed
+            self.last_write_error = None
+            return removed
+        except Exception as exception:
+            self.last_pruned = ()
+            self.last_write_error = f"{type(exception).__name__}: {exception}"
+            return ()
+
     def apply_operations(
         self,
         operations: list[SemanticOperation] | tuple[SemanticOperation, ...],
@@ -211,7 +293,11 @@ class SemanticMemory:
                 continue
             value = (operation.value or "").strip()
             existing = candidate.get(index)
-            if existing and existing.value == value:
+            if (
+                existing
+                and existing.value == value
+                and existing.importance == operation.importance
+            ):
                 continue
             upserts.append(operation)
 
@@ -242,21 +328,21 @@ class SemanticMemory:
                     created_at=existing.created_at if existing else now,
                     updated_at=now,
                     embedding=vector,
+                    importance=operation.importance,
+                    recall_count=existing.recall_count if existing else 0,
+                    last_recalled_at=(
+                        existing.last_recalled_at if existing else None
+                    ),
                 )
                 applied.append(operation)
 
             if candidate == self._entries:
                 self.last_write_error = None
                 return ()
-            if len(candidate) > self.max_entries:
-                oldest = sorted(
-                    candidate.items(),
-                    key=lambda item: (item[1].updated_at, item[0]),
-                )
-                for index, _ in oldest[:len(candidate) - self.max_entries]:
-                    candidate.pop(index)
+            candidate, pruned = self._prune_candidate(candidate)
             self._save(candidate)
             self._entries = candidate
+            self.last_pruned = pruned
             self.last_write_error = None
             return tuple(applied)
         except Exception as exception:
@@ -300,10 +386,37 @@ class SemanticMemory:
                 reverse=True,
             )
             self.last_recall_error = None
-            return tuple(recalled[:limit])
+            result = tuple(recalled[:limit])
+            self._record_recall(result)
+            return result
         except Exception as exception:
             self.last_recall_error = f"{type(exception).__name__}: {exception}"
             return ()
+
+    def _record_recall(
+        self,
+        recalled: tuple[RecalledSemanticEntry, ...],
+    ) -> None:
+        if not recalled:
+            self.last_access_error = None
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        candidate = dict(self._entries)
+        for item in recalled:
+            index = (item.entry.category, item.entry.key)
+            existing = candidate.get(index)
+            if existing is None:
+                continue
+            candidate[index] = existing.model_copy(update={
+                "recall_count": existing.recall_count + 1,
+                "last_recalled_at": now,
+            })
+        try:
+            self._save(candidate)
+            self._entries = candidate
+            self.last_access_error = None
+        except Exception as exception:
+            self.last_access_error = f"{type(exception).__name__}: {exception}"
 
     def format_context(
         self,

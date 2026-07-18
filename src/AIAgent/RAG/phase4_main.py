@@ -127,6 +127,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="经验库最大条数（默认: 200）",
     )
     parser.add_argument(
+        "--episodic-retention-days",
+        type=int,
+        default=30,
+        help="情景记忆基础保留天数（默认: 30）",
+    )
+    parser.add_argument(
         "--semantic-memory-file",
         type=str,
         default=None,
@@ -149,6 +155,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=500,
         help="长期语义记忆最大条数（默认: 500）",
+    )
+    parser.add_argument(
+        "--semantic-retention-days",
+        type=int,
+        default=90,
+        help="语义记忆基础保留天数（默认: 90）",
     )
     return parser.parse_args(argv)
 
@@ -239,6 +251,7 @@ def print_help(
   直接输入问题  → 使用当前短期记忆继续对话
   /memory       → 查看当前窗口中的完整问答
   /clear        → 清空短期记忆
+  /prune        → 清理达到遗忘阈值的长期记忆
   /help         → 显示帮助
   /quit         → 退出
 """
@@ -429,6 +442,7 @@ def main(argv: list[str] | None = None) -> None:
                 top_k=args.semantic_top_k,
                 min_similarity=args.semantic_min_score,
                 max_entries=args.semantic_max_entries,
+                retention_days=args.semantic_retention_days,
             )
             agent.register_tool(
                 semantic_memory.tool_spec(),
@@ -469,6 +483,7 @@ def main(argv: list[str] | None = None) -> None:
                 top_k=args.episodic_top_k,
                 min_similarity=args.episodic_min_score,
                 max_episodes=args.episodic_max_episodes,
+                retention_days=args.episodic_retention_days,
             )
             episodic_agent = EpisodicAgent(agent, episodic_memory)
             query_agent = episodic_agent
@@ -520,6 +535,25 @@ def main(argv: list[str] | None = None) -> None:
                 print("未启用语义记忆，请使用 --semantic-memory-file。")
             else:
                 print_semantic(semantic_memory)
+            continue
+        if question == "/prune":
+            if episodic_memory is None and semantic_memory is None:
+                print("未启用长期记忆，请使用 --episodic-memory-file 或 --semantic-memory-file。")
+                continue
+            if semantic_memory is not None:
+                removed_facts = semantic_memory.prune()
+                if semantic_memory.last_write_error:
+                    print(f"⚠️ 语义记忆清理失败: {semantic_memory.last_write_error}")
+                else:
+                    keys = ", ".join(entry.key for entry in removed_facts) or "无"
+                    print(f"🧹 已清理 {len(removed_facts)} 条语义记忆: {keys}")
+            if episodic_memory is not None:
+                removed_episodes = episodic_memory.prune()
+                if episodic_memory.last_recording_error:
+                    print(f"⚠️ 情景记忆清理失败: {episodic_memory.last_recording_error}")
+                else:
+                    ids = ", ".join(entry.id for entry in removed_episodes) or "无"
+                    print(f"🧹 已清理 {len(removed_episodes)} 条情景记忆: {ids}")
             continue
         if question.startswith("/recall-semantic"):
             if semantic_memory is None:
